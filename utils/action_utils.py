@@ -4,22 +4,15 @@ from typing import List, Tuple
 YAW_LIST = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
 PITCH_LIST = [-20.0, 0.0, 20.0, 40.0]
 
-YAW_DICT = {
+DYAW_DICT = {
     '0.0': 0,
-    '45.0': 1,
-    '90.0': 2,
-    '135.0': 3,
-    '180.0': 4,
-    '225.0': 5,
-    '270.0': 6,
-    '315.0': 7
+    '45.0': 1
 }
 
-PITCH_DICT = {
-    '-20.0': 0,
-    '0.0': 1,
-    '20.0': 2,
-    '40.0': 3
+DPITCH_DICT = {
+    '0.0': 0,
+    '-60.0': 1,
+    '20.0': 2
 }
 
 
@@ -51,13 +44,35 @@ def build_action_tensor(yaw_list: List[float] = YAW_LIST,
     action_tensor = torch.tensor(actions, dtype=torch.float32)  # [T, 2]
     return action_tensor
 
+
 class ActionTokenizer:
-    def __init__(self, yaw_dict=YAW_DICT, pitch_dict=PITCH_DICT):
+    def __init__(self, yaw_dict=DYAW_DICT, pitch_dict=DPITCH_DICT):
         self.yaw_dict = yaw_dict
         self.pitch_dictx = pitch_dict
 
     def yaw_to_id(self, angle):
-        return self.yaw_dict.get(str(angle))
+        return self.yaw_dict.get(str(float(angle)))
 
     def pitch_to_id(self, angle):
-        return self.pitch_dictx.get(str(angle))
+        return self.pitch_dictx.get(str(float(angle)))
+
+    def encode_pair(self, dyaw, dpitch):
+        return torch.tensor(
+            [self.yaw_to_id(dyaw), self.pitch_to_id(dpitch)],
+            dtype=torch.long
+        )
+
+    def encode_sequence(self, action_seq):
+        if isinstance(action_seq, torch.Tensor):
+            action_seq = action_seq.cpu().numpy()
+
+        ids = []
+        for dyaw, dpitch in action_seq:  # T loops
+            dyaw = float(dyaw)
+            dpitch = float(dpitch)
+            ids.append([
+                self.yaw_to_id(dyaw),
+                self.pitch_to_id(dpitch),
+            ])
+
+        return torch.tensor(ids, dtype=torch.long)

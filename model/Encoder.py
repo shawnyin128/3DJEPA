@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torchvision
 
-from utils.action_utils import ActionTokenizer
-from utils.dataset_utils import ShapeNetDataset
 from utils.model_utils import build_rope_cache, apply_rotary_pos_emb_image_only, repeat_kv
 
 
@@ -123,12 +121,10 @@ class Encoder(nn.Module):
         ])
         self.post_norm = nn.RMSNorm(hidden_size, eps=1e-6)
 
-
     def train(self, mode: bool = True):
         super().train(mode)
         self.convnext.eval()
         return self
-
 
     def forward(self, inputs, actions):
         # extract feature map from convnext
