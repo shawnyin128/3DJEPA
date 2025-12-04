@@ -59,7 +59,7 @@ optimizer = torch.optim.AdamW(jepa.parameters(), lr=lr)
 
 # dataset initialization
 dataset = ShapeNetDataset(root="../data/3D", split="train")
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 scheduler = get_scheduler(name="cosine", optimizer=optimizer, num_warmup_steps=0, num_training_steps=epoch * len(dataloader))
 
 # action initialization
