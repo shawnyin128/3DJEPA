@@ -17,11 +17,11 @@ wandb.login(key="c607812d07dd287739ac6ae32c2be43cea6dc664")
 # train configuration
 hidden_size = 1024
 head_dim = 128
-head_num = 32
-kv_head_num = 8
+head_num = 16
+kv_head_num = 4
 num_yaw = 2
 num_pitch = 3
-num_layers = 8
+num_layers = 6
 epoch = 20
 batch_size = 16
 lr = 1e-3
