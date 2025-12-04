@@ -30,7 +30,7 @@ class JEPAModel(nn.Module):
 
         for t in range(1, T):
             x_prev = images[:, t - 1]
-            action = actions[t-1, :]
+            action = actions[:, t-1, :]
 
             tokens = self.encoder(x_prev, action)
             z_online = self.predictor(tokens)

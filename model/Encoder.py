@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torchvision
 
+from torchvision.models import ConvNeXt_Base_Weights
+
 from utils.model_utils import build_rope_cache, apply_rotary_pos_emb_image_only, repeat_kv
 
 
@@ -19,7 +21,7 @@ class ActionEmbedding(nn.Module):
         yaw_tok = yaw_tok + self.type_embed(torch.zeros_like(yaw_ids))
         pitch_tok = pitch_tok + self.type_embed(torch.ones_like(pitch_ids))
 
-        action_tokens = torch.cat([yaw_tok.unsqueeze(0), pitch_tok.unsqueeze(0)], dim=0)
+        action_tokens = torch.stack([yaw_tok, pitch_tok], dim=1)
         return action_tokens
 
 
@@ -111,7 +113,7 @@ class EncoderBlock(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, head_num, kv_head_num, head_dim, hidden_size, num_yaw, num_pitch, num_layers):
         super().__init__()
-        self.convnext = torchvision.models.convnext_base(pretrained=True).features
+        self.convnext = torchvision.models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT).features
         for p in self.convnext.parameters():
             p.requires_grad_(False)
 
@@ -136,8 +138,8 @@ class Encoder(nn.Module):
         image_tokens = img.view(B, C, H * W).transpose(1, 2)
 
         # encode action tokens
-        yaw_ids, pitch_ids = actions[0], actions[1]
-        action_tokens = self.action_embed(yaw_ids, pitch_ids).unsqueeze(0)
+        yaw_ids, pitch_ids = actions[:, 0].long(), actions[:, 1].long()
+        action_tokens = self.action_embed(yaw_ids, pitch_ids)
 
         # concat action + image: [B, 2 + H*W, hidden_size]
         tokens = torch.cat([action_tokens, image_tokens], dim=1)

@@ -2,11 +2,13 @@ import torch
 import torch.nn as nn
 import torchvision
 
+from torchvision.models import ConvNeXt_Base_Weights
+
 
 class Decoder(nn.Module):
     def __init__(self, hidden_size: int, proj_dim: int):
         super().__init__()
-        self.convnext = torchvision.models.convnext_base(pretrained=True).features
+        self.convnext = torchvision.models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT).features
         for p in self.convnext.parameters():
             p.requires_grad_(False)
         self.mlp = nn.Sequential(

@@ -62,7 +62,7 @@ class ActionTokenizer:
             dtype=torch.long
         )
 
-    def encode_sequence(self, action_seq):
+    def encode_sequence(self, action_seq, batch_size, device):
         if isinstance(action_seq, torch.Tensor):
             action_seq = action_seq.cpu().numpy()
 
@@ -75,4 +75,4 @@ class ActionTokenizer:
                 self.pitch_to_id(dpitch),
             ])
 
-        return torch.tensor(ids, dtype=torch.long)
+        return torch.tensor(ids, dtype=torch.long).unsqueeze(0).expand(batch_size, -1, -1).to(device)

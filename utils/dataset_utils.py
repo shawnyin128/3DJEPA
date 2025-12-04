@@ -17,10 +17,12 @@ def angle_str(angle: float) -> str:
 
 class ShapeNetDataset(Dataset):
     def __init__(self, root: str,
+                 split: str = "train",
                  max_objs_per_synset: Optional[int] = None,
                  img_size: int = 256):
         super().__init__()
-        self.root_3d = root
+        self.root = root
+        self.split = split
 
         trans = [
             transforms.Resize((img_size, img_size)),
@@ -39,7 +41,7 @@ class ShapeNetDataset(Dataset):
 
     def _build_index(self, max_objs_per_synset: Optional[int]):
         for syn in self.synsets:
-            syn_dir = os.path.join(self.root_3d, syn)
+            syn_dir = os.path.join(self.root, syn, self.split)
             if not os.path.isdir(syn_dir):
                 continue
 
@@ -110,3 +112,4 @@ class ShapeNetDataset(Dataset):
             "seq_len": T,
         }
         return images, meta
+
