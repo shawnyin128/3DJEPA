@@ -1,10 +1,10 @@
 import os
 import torch
+import numpy as np
 
 from torch.utils.data import Dataset
 from torchvision import transforms
-
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from PIL import Image
 
 from utils.action_utils import YAW_LIST, PITCH_LIST
@@ -19,10 +19,12 @@ class ShapeNetDataset(Dataset):
     def __init__(self, root: str,
                  split: str = "train",
                  max_objs_per_synset: Optional[int] = None,
-                 img_size: int = 256):
+                 img_size: int = 256,
+                 return_cam: bool = False):
         super().__init__()
         self.root = root
         self.split = split
+        self.return_cam = return_cam
 
         trans = [
             transforms.Resize((img_size, img_size)),
@@ -61,18 +63,32 @@ class ShapeNetDataset(Dataset):
                     continue
 
                 img_paths: List[str] = []
+                cam_paths: List[str] = []
                 missing = False
+
                 for yaw in YAW_LIST:
                     y_str = angle_str(yaw)
                     for pitch in PITCH_LIST:
                         p_str = angle_str(pitch)
-                        fname = f"view_y{y_str}_p{p_str}.png"
-                        path = os.path.join(gen_dir, fname)
-                        if not os.path.isfile(path):
-                            print(f"[MISSING] {syn}/{obj_id} missing {fname}")
+
+                        img_name = f"view_y{y_str}_p{p_str}.png"
+                        cam_name = f"cam_y{y_str}_p{p_str}.txt"
+
+                        img_path = os.path.join(gen_dir, img_name)
+                        cam_path = os.path.join(gen_dir, cam_name)
+
+                        if not os.path.isfile(img_path):
+                            print(f"[MISSING] {syn}/{obj_id} missing {img_name}")
                             missing = True
                             break
-                        img_paths.append(path)
+
+                        if self.return_cam and not os.path.isfile(cam_path):
+                            print(f"[MISSING] {syn}/{obj_id} missing {cam_name}")
+                            missing = True
+                            break
+
+                        img_paths.append(img_path)
+                        cam_paths.append(cam_path)
                     if missing:
                         break
 
@@ -85,6 +101,7 @@ class ShapeNetDataset(Dataset):
                         synset=syn,
                         obj_id=obj_id,
                         img_paths=img_paths,
+                        cam_paths=cam_paths,
                         seq_len=len(img_paths),
                     )
                 )
@@ -97,6 +114,10 @@ class ShapeNetDataset(Dataset):
     def _load_image(self, path: str) -> torch.Tensor:
         img = Image.open(path).convert("RGB")
         return self.transform(img)
+
+    def _load_cam(self, path: str) -> torch.Tensor:
+        M = np.loadtxt(path, dtype=np.float32).reshape(4, 4)
+        return torch.from_numpy(M)
 
     def __getitem__(self, idx: int):
         rec = self.obj_sequences[idx]
@@ -111,5 +132,12 @@ class ShapeNetDataset(Dataset):
             "obj_id": rec["obj_id"],
             "seq_len": T,
         }
-        return images, meta
 
+        if not self.return_cam:
+            return images, meta
+
+        cam_paths = rec["cam_paths"]
+        cams = [self._load_cam(p) for p in cam_paths]
+        cam_mats = torch.stack(cams, dim=0)
+
+        return images, cam_mats, meta
