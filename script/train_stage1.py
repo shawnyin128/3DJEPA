@@ -23,8 +23,8 @@ num_yaw = 2
 num_pitch = 3
 num_layers = 6
 epoch = 20
-batch_size = 16
-lr = 1e-3
+batch_size = 64
+lr = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # wandb project initialization
