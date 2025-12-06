@@ -21,8 +21,8 @@ head_num = 16
 kv_head_num = 4
 num_yaw = 2
 num_pitch = 3
-num_layers = 6
-epoch = 20
+num_layers = 8
+epoch = 50
 batch_size = 64
 lr = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,7 +59,7 @@ optimizer = torch.optim.AdamW(jepa.parameters(), lr=lr)
 
 # dataset initialization
 dataset = ShapeNetDataset(root="../data/3D", split="train")
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, shuffle=True, drop_last=True)
 scheduler = get_scheduler(name="cosine", optimizer=optimizer, num_warmup_steps=0, num_training_steps=epoch * len(dataloader))
 
 # action initialization
@@ -98,6 +98,6 @@ for _ in tqdm(range(epoch), leave=False):
         tqdm.write(f"loss={loss.item():.4f}  sim={stats['sim']:.4f}  var={stats['var']:.4f}")
 
 model_state = jepa.state_dict()
-torch.save(model_state, "../data/checkpoint/jepa_model_stage1.pth")
+torch.save(model_state, "../data/checkpoint/jepa_model_stage1_non_world.pth")
 
 wandb.finish()
