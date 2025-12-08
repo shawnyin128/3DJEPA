@@ -42,15 +42,3 @@ def vic_loss(z1: torch.Tensor,
         "cov": cov_loss.detach(),
     }
     return total, stats
-
-if __name__ == '__main__':
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    B, D = 8, 256
-    z1 = torch.randn(B, D, device=device)
-    z2 = torch.randn(B, D, device=device)
-
-    loss, stats = vic_loss(z1, z2)
-    print("vic_loss random:", loss, stats)
-    print("isnan(loss)?", torch.isnan(loss))
-    print("isnan(sim/var/cov)?", {k: torch.isnan(v) for k, v in stats.items()})

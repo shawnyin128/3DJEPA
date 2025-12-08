@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.nn.functional as F
 import gsplat
 
 
@@ -45,3 +46,37 @@ def render_gaussians_single_cam(means: torch.Tensor, # [N, 3]
     )
 
     return render_colors[0], render_alphas[0], meta
+
+
+# TODO
+def render_gaussians_batch(
+        means, quats, scales_raw,  # scales_raw是未处理的
+        opacity_logits, color_logits,
+        viewmats, Ks, H, W
+):
+    B, N, _ = means.shape
+
+    # 四元数归一化
+    quats_normed = F.normalize(quats, dim=-1)
+
+    # 确保scales为正（这里scales_raw已经是softplus的输出）
+    scales = scales_raw.clamp(min=1e-4, max=10.0)  # 添加clamp防止极值
+
+    opacities = torch.sigmoid(opacity_logits)
+    colors = torch.sigmoid(color_logits)
+
+    viewmats = viewmats.unsqueeze(1)
+    Ks = Ks.unsqueeze(1)
+
+    render_colors, render_alphas, meta = gsplat.rasterization(
+        means,
+        quats_normed,
+        scales,
+        opacities,
+        colors,
+        viewmats,
+        Ks,
+        W, H,
+        packed=False
+    )
+    return render_colors[:, 0], render_alphas[:, 0], meta

@@ -20,7 +20,7 @@ class ShapeNetDataset(Dataset):
                  split: str = "train",
                  max_objs_per_synset: Optional[int] = None,
                  img_size: int = 256,
-                 return_cam: bool = False):
+                 return_cam: bool = False) -> None:
         super().__init__()
         self.root = root
         self.split = split
