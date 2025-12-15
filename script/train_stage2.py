@@ -1,27 +1,48 @@
-import wandb
-import torch
+"""
+Stage2训练 - 修复版
+"""
+import sys
+import os
+
+# RMSNorm补丁
 import torch.nn as nn
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return self.weight * x / rms
+
+
+if not hasattr(nn, 'RMSNorm'):
+    nn.RMSNorm = RMSNorm
+
+import torch
 import torch.nn.functional as F
-import torchvision.utils as vutils
+import matplotlib
 
-from tqdm import tqdm
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 from torch.utils.data import DataLoader
-from transformers import get_scheduler
-
 from model.JEPA import JEPAModel
 from model.SVJ import SVJ
 from utils.action_utils import ActionTokenizer, build_action_tensor
 from utils.dataset_utils import ShapeNetDataset
 from utils.gs_utils import make_intrinsics_from_fov, render_gaussians_batch
 
-
-# wandb login
-wandb.login(key="c607812d07dd287739ac6ae32c2be43cea6dc664")
-
-# device
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# JEPA configuration
+print("=" * 70)
+print("Stage2训练 - 修复版")
+print("=" * 70)
+
+# JEPA配置
 hidden_size = 1024
 head_dim = 128
 head_num = 16
@@ -30,7 +51,8 @@ num_yaw = 2
 num_pitch = 3
 num_layers = 8
 
-# define and load JEPA model
+# 加载Stage1模型
+print("\n[1] 加载Stage1模型...")
 jepa = JEPAModel(
     hidden_size=hidden_size,
     head_dim=head_dim,
@@ -40,7 +62,7 @@ jepa = JEPAModel(
     num_pitch=num_pitch,
     num_layers=num_layers
 )
-jepa.load_state_dict(torch.load("../data/checkpoint/jepa_model_stage1.pth", map_location=torch.device(device)))
+jepa.load_state_dict(torch.load("/scratch/xy2053/course_project/cv-final/data/checkpoint/jepa_model_stage1.pth", map_location=device))
 convnext = jepa.convnext
 encoder = jepa.encoder
 for p in convnext.parameters():
@@ -48,107 +70,134 @@ for p in convnext.parameters():
 for p in encoder.parameters():
     p.requires_grad_(False)
 del jepa
+print("  ✓ Stage1模型加载完成")
 
-# train setup
-epoch = 10
-batch_size = 64
-lr = 1e-4
+# 加载数据
+print("\n[2] 加载数据...")
+dataset = ShapeNetDataset(root="/scratch/xy2053/course_project/cv-final/data/3D", split="train", return_cam=True, synsets=["02958343"])
+print(f"  数据集大小: {len(dataset)}")
 
-# dataset initialization
-dataset = ShapeNetDataset(root="../data/3D", split="train", return_cam=True)
-dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, shuffle=True, drop_last=True)
+dataloader = DataLoader(dataset, batch_size=16, num_workers=8, shuffle=True)
+print("  ✓ DataLoader创建完成")
 
-# action initialization
-action_tokenizer = ActionTokenizer()
-action_sequence = build_action_tensor()
-action_tensor = action_tokenizer.encode_sequence(action_sequence, batch_size, device=device)
-
-# define svj
-svj = SVJ(convnext, encoder, hidden_size, head_num, kv_head_num, head_dim).to(device)
+# 初始化SVJ
+print("\n[3] 初始化SVJ...")
+num_latent = 10240
+svj = SVJ(convnext, encoder, hidden_size, head_num, kv_head_num, head_dim, num_latent=num_latent).to(device)
 svj.train()
 
-# optimizer and scheduler initialization
-optimizer = torch.optim.AdamW(svj.parameters(), lr=3e-4)
-scheduler = get_scheduler(name="cosine", optimizer=optimizer, num_warmup_steps=0, num_training_steps=epoch * len(dataloader))
+optimizer = torch.optim.AdamW(svj.parameters(), lr=1e-5)  # 更小的学习率
+print("  ✓ SVJ初始化完成 (lr=1e-5)")
 
-# wandb init
-wandb.init(
-    project="CV-JEPA-3DGS",
-    name="jepa_run_002",
-    config={
-        "hidden_size": hidden_size,
-        "head_dim": head_dim,
-        "head_num": head_num,
-        "kv_head_num": kv_head_num,
-        "num_yaw": num_yaw,
-        "num_pitch": num_pitch,
-        "num_jepa_layers": num_layers,
-        "num_svj_layers": 4,
-        "batch_size": batch_size,
-        "learning_rate": lr,
-    }
-)
+# Action
+action_tokenizer = ActionTokenizer()
+action_sequence = build_action_tensor()
+action_tensor = action_tokenizer.encode_sequence(action_sequence, batch_size=16, device=device)
 
-# training loop
-global_step = 0
-for _ in tqdm(range(epoch), leave=False):
-    for batch in tqdm(dataloader, leave=False):
-        imgs, cams, meta = batch
-        imgs = imgs.to(device)
-        cams = cams.to(device)
-        B, T, C, H, W = imgs.shape
+# 创建输出目录
+print("\n[4] 训练1000步...")
+print("=" * 70)
 
-        means, quats, scales, opacities, colors = svj(imgs, action_tensor)
+losses = []
+data_iter = iter(dataloader)
 
-        viewmats = cams[:, 0]
-        K_single = make_intrinsics_from_fov(H, W, device=device)
-        Ks = K_single.unsqueeze(0).expand(B, -1, -1)
+for step in range(1000):
+    try:
+        batch = next(data_iter)
+    except StopIteration:
+        data_iter = iter(dataloader)
+        batch = next(data_iter)
 
-        render_colors, render_alphas, _ = render_gaussians_batch(
-            means, quats, scales, opacities, colors,
-            viewmats, Ks,
-            H, W,
-        )
+    imgs, cams, meta = batch
+    imgs = imgs.to(device)
+    cams = cams.to(device)
+    B, T, C, H, W = imgs.shape
 
-        target = imgs[:, 0].permute(0, 2, 3, 1)
+    # 前向传播
+    means, quats, scales, opacities, colors = svj(imgs, action_tensor[:B])
 
-        loss = F.mse_loss(render_colors, target)
+    # 渲染
+    viewmats = cams[:, 0]
+    K_single = make_intrinsics_from_fov(H, W, device=device)
+    Ks = K_single.unsqueeze(0).expand(B, -1, -1)
 
-        optimizer.zero_grad()
-        loss.backward()
+    render_colors, render_alphas, _ = render_gaussians_batch(
+        means, quats, scales, opacities, colors,
+        viewmats, Ks, H, W,
+    )
 
-        grad_norm = nn.utils.clip_grad_norm_(svj.parameters(), 1.0)
+    target = imgs[:, 0].permute(0, 2, 3, 1)
 
-        optimizer.step()
-        scheduler.step()
+    # 主loss
+    mse_loss = F.mse_loss(render_colors, target)
 
-        wandb.log(
-            {
-                "loss": loss.item(),
-                "grad_norm": grad_norm.item(),
-            },
-            step=global_step,
-        )
+    # 正则化：颜色多样性
+    colors_sigmoid = torch.sigmoid(colors)
+    color_mean_per_sample = colors_sigmoid.mean(dim=1, keepdim=True)
+    color_variance = ((colors_sigmoid - color_mean_per_sample) ** 2).mean()
+    diversity_loss = 1.0 / (color_variance + 1e-4)
 
-        if global_step == 0 or global_step % 10 == 0:
-            b = 0
+    # 正则化：位置分散
+    means_std = means.std(dim=1).mean()
+    position_loss = 1.0 / (means_std + 1e-4)
 
-            target_img = imgs[b, 0]
-            render_img = render_colors[b]
-            render_img = render_img.permute(2, 0, 1)
+    # 总loss
+    loss = mse_loss + 0.1 * diversity_loss + 0.05 * position_loss
 
-            grid = torch.cat([
-                target_img.unsqueeze(0),
-                render_img.unsqueeze(0),
-            ], dim=0)  # [2,3,H,W]
+    # 反向传播
+    optimizer.zero_grad()
+    loss.backward()
+    grad_norm = nn.utils.clip_grad_norm_(svj.parameters(), 1.0)
+    optimizer.step()
 
-            grid = vutils.make_grid(grid, nrow=2)
+    losses.append(loss.item())
 
-            wandb.log({"gt_vs_render": wandb.Image(grid)}, step=global_step)
+    # 统计
+    if step % 20 == 0:
+        render_mean = render_colors.mean().item()
+        print(f"Step {step + 1}/1000:")
+        print(
+            f"  Loss: {loss.item():.4f} (MSE={mse_loss.item():.4f}, Div={diversity_loss.item():.4f}, Pos={position_loss.item():.4f})")
+        print(f"  Render: mean={render_mean:.3f}")
+        print(f"  Means: std={means.std().item():.3f}")
+        print(f"  Colors: std={colors_sigmoid.std().item():.3f}")
+        print(f"  Opacities: mean={torch.sigmoid(opacities).mean().item():.3f}")
 
-        global_step += 1
+    # 每20步保存可视化
+    if step % 20 == 0:
+        fig, axes = plt.subplots(B, 3, figsize=(12, 3 * B))
+        if B == 1:
+            axes = axes.reshape(1, -1)
 
-model_state = svj.state_dict()
-torch.save(model_state, "../data/checkpoint/jepa_model_stage2.pth")
+        for b in range(B):
+            gt = target[b].cpu().numpy()
+            axes[b, 0].imshow(gt)
+            axes[b, 0].set_title(f'GT (mean={gt.mean():.3f})')
+            axes[b, 0].axis('off')
 
-wandb.finish()
+            render = render_colors[b].detach().cpu().numpy()
+            axes[b, 1].imshow(render)
+            axes[b, 1].set_title(f'Render (mean={render.mean():.3f})')
+            axes[b, 1].axis('off')
+
+            alpha = render_alphas[b].detach().cpu().numpy()
+            im = axes[b, 2].imshow(alpha, cmap='gray', vmin=0, vmax=1)
+            axes[b, 2].set_title(f'Alpha (mean={alpha.mean():.3f})')
+            axes[b, 2].axis('off')
+            plt.colorbar(im, ax=axes[b, 2])
+
+        plt.tight_layout()
+        plt.savefig(f'./vis/step{step + 1:04d}.png', dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        if step % 20 == 0:
+            print(f"  ✓ 保存: stage2_renders_fixed/step{step + 1:04d}.png")
+            print()
+
+print("=" * 70)
+print("训练完成！")
+print("=" * 70)
+
+# 保存模型
+model_path = "/scratch/xy2053/course_project/cv-final/data/checkpoint/stage2_fixed.pth"
+torch.save(svj.state_dict(), model_path)
+print(f"✓ 模型已保存到: {model_path}")

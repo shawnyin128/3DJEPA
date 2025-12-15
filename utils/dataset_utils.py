@@ -18,6 +18,7 @@ def angle_str(angle: float) -> str:
 class ShapeNetDataset(Dataset):
     def __init__(self, root: str,
                  split: str = "train",
+                 synsets: Optional[List[str]] = None,
                  max_objs_per_synset: Optional[int] = None,
                  img_size: int = 256,
                  return_cam: bool = False) -> None:
@@ -36,7 +37,11 @@ class ShapeNetDataset(Dataset):
             d for d in os.listdir(root)
             if os.path.isdir(os.path.join(root, d))
         )
-        self.synsets = all_synsets
+        if synsets is not None:
+            self.synsets = [s for s in all_synsets if s in synsets]
+        else:
+            self.synsets = all_synsets
+        # self.synsets = all_synsets
 
         self.obj_sequences: List[Dict[str, Any]] = []
         self._build_index(max_objs_per_synset=max_objs_per_synset)
