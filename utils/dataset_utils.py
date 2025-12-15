@@ -21,11 +21,13 @@ class ShapeNetDataset(Dataset):
                  synsets: Optional[List[str]] = None,
                  max_objs_per_synset: Optional[int] = None,
                  img_size: int = 256,
-                 return_cam: bool = False) -> None:
+                 return_cam: bool = False,
+                 return_obj: bool = False) -> None:
         super().__init__()
         self.root = root
         self.split = split
         self.return_cam = return_cam
+        self.return_obj = return_obj
 
         trans = [
             transforms.Resize((img_size, img_size)),
@@ -69,6 +71,7 @@ class ShapeNetDataset(Dataset):
 
                 img_paths: List[str] = []
                 cam_paths: List[str] = []
+                obj_paths: List[str] = []
                 missing = False
 
                 for yaw in YAW_LIST:
@@ -94,6 +97,14 @@ class ShapeNetDataset(Dataset):
 
                         img_paths.append(img_path)
                         cam_paths.append(cam_path)
+                        if self.return_obj:
+                            obj_name = f"obj_y{y_str}_p{p_str}.txt"
+                            obj_path = os.path.join(gen_dir, obj_name)
+                            if not os.path.isfile(obj_path):
+                                print(f"[MISSING] {syn}/{obj_id} missing {obj_name}")
+                                missing = True
+                                break
+                            obj_paths.append(obj_path)
                     if missing:
                         break
 
@@ -101,15 +112,16 @@ class ShapeNetDataset(Dataset):
                     print(f"[SKIP] {syn}/{obj_id} due to missing views")
                     continue
 
-                self.obj_sequences.append(
-                    dict(
-                        synset=syn,
-                        obj_id=obj_id,
-                        img_paths=img_paths,
-                        cam_paths=cam_paths,
-                        seq_len=len(img_paths),
-                    )
+                rec = dict(
+                    synset=syn,
+                    obj_id=obj_id,
+                    img_paths=img_paths,
+                    cam_paths=cam_paths,
+                    seq_len=len(img_paths),
                 )
+                if self.return_obj:
+                    rec["obj_paths"] = obj_paths
+                self.obj_sequences.append(rec)
 
         print(f"[SeqImageDataset] total valid objects = {len(self.obj_sequences)}")
 
@@ -121,6 +133,10 @@ class ShapeNetDataset(Dataset):
         return self.transform(img)
 
     def _load_cam(self, path: str) -> torch.Tensor:
+        M = np.loadtxt(path, dtype=np.float32).reshape(4, 4)
+        return torch.from_numpy(M)
+
+    def _load_obj(self, path: str) -> torch.Tensor:
         M = np.loadtxt(path, dtype=np.float32).reshape(4, 4)
         return torch.from_numpy(M)
 
@@ -138,11 +154,19 @@ class ShapeNetDataset(Dataset):
             "seq_len": T,
         }
 
-        if not self.return_cam:
+        if not self.return_cam and not self.return_obj:
             return images, meta
 
-        cam_paths = rec["cam_paths"]
-        cams = [self._load_cam(p) for p in cam_paths]
-        cam_mats = torch.stack(cams, dim=0)
-
-        return images, cam_mats, meta
+        out: List[Any] = [images]
+        if self.return_cam:
+            cam_paths = rec["cam_paths"]
+            cams = [self._load_cam(p) for p in cam_paths]
+            cam_mats = torch.stack(cams, dim=0)
+            out.append(cam_mats)
+        if self.return_obj:
+            obj_paths = rec.get("obj_paths", [])
+            objs = [self._load_obj(p) for p in obj_paths]
+            obj_mats = torch.stack(objs, dim=0) if len(objs) > 0 else torch.empty(0)
+            out.append(obj_mats)
+        out.append(meta)
+        return tuple(out)

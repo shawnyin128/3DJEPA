@@ -22,6 +22,37 @@ def make_intrinsics_from_fov(H: int,
     return K
 
 
+def make_intrinsics_from_blender(H: int,
+                                 W: int,
+                                 device: str = "cuda",
+                                 lens_mm: float = 55.0,
+                                 sensor_width_mm: float = 36.0,
+                                 sensor_height_mm: float = 24.0) -> torch.Tensor:
+    """
+    根据 Blender 相机参数计算像素内参：
+    - fx = W * lens_mm / sensor_width_mm
+    - fy = H * lens_mm / sensor_height_mm
+    - cx = W/2, cy = H/2
+
+    默认参数与数据生成脚本保持一致：lens=55mm，sensor=36×24mm。
+    """
+    device = torch.device(device)
+    fx = float(W) * float(lens_mm) / float(sensor_width_mm)
+    fy = float(H) * float(lens_mm) / float(sensor_height_mm)
+    cx = float(W) / 2.0
+    cy = float(H) / 2.0
+    K = torch.tensor(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    return K
+
+
 def render_gaussians_single_cam(means: torch.Tensor, # [N, 3]
                                 quats: torch.Tensor, # [N, 4]
                                 scales: torch.Tensor, # [N, 3]
