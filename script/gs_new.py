@@ -203,6 +203,98 @@ def _init_gaussians_with_encoder_prior(view_img: torch.Tensor,   # [3,H,W]
     print("[ENC_PRIOR] 使用 Encoder 先验完成初始化")
     return means, quats, scales, opacities, colors
 
+def _rotmat3_to_quat_xyzw(R: torch.Tensor) -> torch.Tensor:
+    """
+    将 3x3 旋转矩阵转换为四元数 (x,y,z,w)，w 在最后。
+    输入：R [...,3,3]
+    输出：q [...,4]，格式 [x,y,z,w]
+    """
+    # 参考自经典实现，数值上做 clamping
+    eps = 1e-8
+    r00 = R[..., 0, 0]
+    r11 = R[..., 1, 1]
+    r22 = R[..., 2, 2]
+    trace = r00 + r11 + r22
+
+    qw = torch.empty_like(trace)
+    qx = torch.empty_like(trace)
+    qy = torch.empty_like(trace)
+    qz = torch.empty_like(trace)
+
+    cond = trace > 0
+    S = torch.sqrt(torch.clamp(trace + 1.0, min=eps)) * 2.0  # S=4*qw
+    qw_pos = 0.25 * S
+    qx_pos = (R[..., 2, 1] - R[..., 1, 2]) / (S + eps)
+    qy_pos = (R[..., 0, 2] - R[..., 2, 0]) / (S + eps)
+    qz_pos = (R[..., 1, 0] - R[..., 0, 1]) / (S + eps)
+
+    # 分支：r00 是最大对角项
+    cond1 = (r00 > r11) & (r00 > r22)
+    S1 = torch.sqrt(torch.clamp(1.0 + r00 - r11 - r22, min=eps)) * 2.0  # S=4*qx
+    qw_1 = (R[..., 2, 1] - R[..., 1, 2]) / (S1 + eps)
+    qx_1 = 0.25 * S1
+    qy_1 = (R[..., 0, 1] + R[..., 1, 0]) / (S1 + eps)
+    qz_1 = (R[..., 0, 2] + R[..., 2, 0]) / (S1 + eps)
+
+    # 分支：r11 最大
+    cond2 = ~cond1 & (r11 > r22)
+    S2 = torch.sqrt(torch.clamp(1.0 + r11 - r00 - r22, min=eps)) * 2.0  # S=4*qy
+    qw_2 = (R[..., 0, 2] - R[..., 2, 0]) / (S2 + eps)
+    qx_2 = (R[..., 0, 1] + R[..., 1, 0]) / (S2 + eps)
+    qy_2 = 0.25 * S2
+    qz_2 = (R[..., 1, 2] + R[..., 2, 1]) / (S2 + eps)
+
+    # 分支：r22 最大
+    S3 = torch.sqrt(torch.clamp(1.0 + r22 - r00 - r11, min=eps)) * 2.0  # S=4*qz
+    qw_3 = (R[..., 1, 0] - R[..., 0, 1]) / (S3 + eps)
+    qx_3 = (R[..., 0, 2] + R[..., 2, 0]) / (S3 + eps)
+    qy_3 = (R[..., 1, 2] + R[..., 2, 1]) / (S3 + eps)
+    qz_3 = 0.25 * S3
+
+    # 组合分支
+    # 首先 trace>0 用 pos 分支
+    qw = torch.where(cond, qw_pos, qw)
+    qx = torch.where(cond, qx_pos, qx)
+    qy = torch.where(cond, qy_pos, qy)
+    qz = torch.where(cond, qz_pos, qz)
+
+    # trace<=0，再根据最大对角选择 1/2/3 分支
+    qw = torch.where(~cond & cond1, qw_1, qw)
+    qx = torch.where(~cond & cond1, qx_1, qx)
+    qy = torch.where(~cond & cond1, qy_1, qy)
+    qz = torch.where(~cond & cond1, qz_1, qz)
+
+    qw = torch.where(~cond & cond2, qw_2, qw)
+    qx = torch.where(~cond & cond2, qx_2, qx)
+    qy = torch.where(~cond & cond2, qy_2, qy)
+    qz = torch.where(~cond & cond2, qz_2, qz)
+
+    qw = torch.where(~cond & ~cond1 & ~cond2, qw_3, qw)
+    qx = torch.where(~cond & ~cond1 & ~cond2, qx_3, qx)
+    qy = torch.where(~cond & ~cond1 & ~cond2, qy_3, qy)
+    qz = torch.where(~cond & ~cond1 & ~cond2, qz_3, qz)
+
+    q = torch.stack([qx, qy, qz, qw], dim=-1)
+    # 归一化
+    q = q / (q.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+    return q
+
+def _quat_mul_xyzw(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """
+    四元数乘法（左乘）：q = q1 ⊗ q2，输入/输出格式均为 [x, y, z, w]。
+    支持广播：q1 [...,4], q2 [...,4] → q [...,4]
+    """
+    x1, y1, z1, w1 = q1.unbind(-1)
+    x2, y2, z2, w2 = q2.unbind(-1)
+    # v = (x, y, z), w 为标量（最后一维）
+    x = w1 * x2 + w2 * x1 + y1 * z2 - z1 * y2
+    y = w1 * y2 + w2 * y1 + z1 * x2 - x1 * z2
+    z = w1 * z2 + w2 * z1 + x1 * y2 - y1 * x2
+    w = w1 * w2 - (x1 * x2 + y1 * y2 + z1 * z2)
+    q = torch.stack([x, y, z, w], dim=-1)
+    q = q / (q.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+    return q
+
 def _render_views_grid(means: torch.Tensor,
                        quats: torch.Tensor,
                        scales: torch.Tensor,
@@ -262,16 +354,13 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
     device = torch.device(device)
 
     # 1. 取一个样本：imgs: [B, T, 3, H, W], cams: [B, T, 4, 4]
-    # 使用训练集 & 开启 batch（当前实现仍取 batch 的第一个样本进行拟合；
-    # 完整的按批拟合需要为每个样本维护独立的高斯参数，这里保持最小改动）
     ds = ShapeNetDataset(root=root,
-                         split="train",
+                         split=split,
                          return_cam=True,
                          return_obj=True,  # 加载对象矩阵以做姿态补偿
                          max_objs_per_synset=1,
                          synsets=["02958343"])  # 仅汽车类
-    BATCH_SIZE = 8
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+    loader = DataLoader(ds, batch_size=1, shuffle=False)
     # 新返回格式：images, cams, objs, meta
     batch = next(iter(loader))
     if len(batch) == 4:
@@ -306,7 +395,7 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
     if use_encoder_prior:
         try:
             means, quats, scales, opacities, colors = _init_gaussians_with_encoder_prior(
-                view_img, view_cam, K, num_points, device
+                view_img, view_cam, K, num_points, device, prior_length=4
             )
         except Exception as e:
             print(f"[WARN] 使用 Encoder 先验初始化失败，改用随机初始化。原因: {e}")
@@ -362,7 +451,7 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
 
         # 视角集合与 encoder prior 一致：t=0 与 t=1（若 T==1 则退化为单视角）
         T_all = imgs.shape[0]
-        idx_list = [0] if T_all == 1 else [0, 1]
+        idx_list = [0] if T_all == 1 else list(range(min(4, T_all)))
 
         photo = 0.0
         per_view_losses = []
@@ -370,12 +459,6 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
         # 对象姿态补偿：将 t0 姿态下学习到的点，变换到目标视角 t 的对象姿态
         obj0 = objs[0].to(device)
         obj0_inv = torch.linalg.inv(obj0)
-
-        # 课程权重：逐步加大第二视角的权重（前 300 步从 0 线性升到 1）
-        w1 = min(1.0, it / 300.0) if len(idx_list) > 1 else 0.0
-
-        l_t0 = None
-        l_t1 = None
 
         for t in idx_list:
             view_img_t = imgs[t].to(device)            # [3,H,W]
@@ -391,13 +474,17 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
             means_t_h = (delta @ means_h.t()).t()      # [N,4]
             means_t = means_t_h[:, :3]
 
-            # 训练渲染时对不透明度 logit 做降温，抑制早期饱和
-            opac_eff = opacities * 0.5
+            # quats_t = q_delta ⊗ quats （四元数左乘），使椭球朝向随对象旋转
+            R_delta = delta[:3, :3].unsqueeze(0)       # [1,3,3]
+            q_delta = _rotmat3_to_quat_xyzw(R_delta)[0]  # [4]
+            q_delta_expand = q_delta.unsqueeze(0).expand_as(quats)  # [N,4]
+            quats_t = _quat_mul_xyzw(q_delta_expand, quats)
+
             pred_t, _, _ = render_gaussians_single_cam(
                 means=means_t,
-                quats=quats,
+                quats=quats_t,
                 scales=scales,
-                opacities=opac_eff,
+                opacities=opacities,
                 colors=colors,
                 viewmat=viewmat_t,
                 K=K,
@@ -405,22 +492,10 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
                 W=W,
             )
             l_t = mse_loss(pred_t, gt_image_t)
-            if t == 0:
-                l_t0 = l_t
-            else:
-                l_t1 = l_t
+            photo = photo + l_t
             per_view_losses.append(l_t.detach())
 
-        if l_t1 is None:
-            photo = l_t0
-        else:
-            photo = (l_t0 + w1 * l_t1) / (1.0 + w1)
-
-        # 轻量正则：稀疏可见性 + 稳定尺度
-        L_opacity = torch.sigmoid(opacities).mean()
-        L_scale = (torch.log(scales + 1e-6) ** 2).mean()
-
-        loss = photo + 1e-3 * L_opacity + 3e-3 * L_scale
+        loss = photo / float(len(idx_list))
         loss.backward()
         optimizer.step()
 
@@ -435,7 +510,7 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
     # 保存两视角（或单视角）GT|Pred 拼图，动作/顺序与 prior 保持一致
     with torch.no_grad():
         tiles = []
-        out_views = [0] if imgs.shape[0] == 1 else [0, 1]
+        out_views = [0] if imgs.shape[0] == 1 else list(range(min(4, imgs.shape[0])))
         obj0 = objs[0].to(device)
         obj0_inv = torch.linalg.inv(obj0)
         for t in out_views:
@@ -450,9 +525,13 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
             means_t_h = (delta @ means_h.t()).t()
             means_t = means_t_h[:, :3]
 
+            R_delta = delta[:3, :3].unsqueeze(0)
+            q_delta = _rotmat3_to_quat_xyzw(R_delta)[0]
+            quats_t = _quat_mul_xyzw(q_delta.unsqueeze(0).expand_as(quats), quats)
+
             pred_t, _, _ = render_gaussians_single_cam(
                 means=means_t,
-                quats=quats,
+                quats=quats_t,
                 scales=scales,
                 opacities=opacities,
                 colors=colors,
@@ -472,10 +551,10 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
 if __name__ == "__main__":
     _fit_one_shapenet_view(
         root="../data/3D",
-        split="test",
-        num_points=20000,
-        iters=600,
-        lr=1e-2,
+        split="train",
+        num_points=40960,
+        iters=20000,
+        lr=1e-3,
         device="cuda",
         save_path="./vis/3dgs_fit_debug_prior.png",
         use_encoder_prior=True,
