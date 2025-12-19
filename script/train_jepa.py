@@ -23,7 +23,7 @@ kv_head_num = 4
 num_yaw = 2
 num_pitch = 3
 num_layers = 2
-epoch = 10
+epoch = 100
 batch_size = 64
 lr = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -44,12 +44,6 @@ wandb.init(
         "learning_rate": lr,
     }
 )
-
-"""
-支持从已有 checkpoint 续训：
-- 优先使用包含优化器/调度器/步数等的 resume 文件（jepa_stage1_resume.pth）
-- 若不存在，则尝试仅加载模型权重文件（jepa_model_stage1_fixed.pth）
-"""
 
 # model & optimizer initialization
 jepa = JEPAModel(
@@ -75,33 +69,9 @@ os.makedirs(ckpt_dir, exist_ok=True)
 model_ckpt_path = os.path.join(ckpt_dir, "jepa_model_stage1_fixed.pth")
 resume_ckpt_path = os.path.join(ckpt_dir, "jepa_stage1_resume.pth")
 
-# try resume
+# start training from scratch
 start_epoch = 0
 global_step = 0
-if os.path.exists(resume_ckpt_path):
-    state = torch.load(resume_ckpt_path, map_location=device)
-    if isinstance(state, dict) and "model" in state:
-        jepa.load_state_dict(state["model"], strict=False)
-        if "optimizer" in state:
-            try:
-                optimizer.load_state_dict(state["optimizer"])
-            except Exception:
-                pass
-        if "scheduler" in state:
-            try:
-                scheduler.load_state_dict(state["scheduler"])
-            except Exception:
-                pass
-        start_epoch = int(state.get("epoch", 0))
-        global_step = int(state.get("global_step", 0))
-        print(f"[RESUME] Loaded training state from {resume_ckpt_path} (epoch={start_epoch}, global_step={global_step})")
-elif os.path.exists(model_ckpt_path):
-    try:
-        weights = torch.load(model_ckpt_path, map_location=device)
-        jepa.load_state_dict(weights, strict=False)
-        print(f"[RESUME] Loaded model weights from {model_ckpt_path}")
-    except Exception as e:
-        print(f"[RESUME] Failed to load model weights: {e}")
 
 # action initialization
 action_tokenizer = ActionTokenizer()
