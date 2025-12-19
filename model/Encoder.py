@@ -6,6 +6,11 @@ from utils.model_utils import build_rope_cache, apply_rotary_pos_emb_image_only,
 
 
 class ActionEmbedding(nn.Module):
+    """
+    Embed discrete action tokens (yaw_id, pitch_id) into continuous vectors.
+    Returns separate yaw/pitch vectors plus a fused action vector for compatibility.
+    """
+    
     def __init__(self, num_yaw: int, num_pitch: int, hidden_size: int):
         super().__init__()
         self.yaw_embed = nn.Embedding(num_yaw, hidden_size)
@@ -29,21 +34,33 @@ class ActionEmbedding(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, yaw_ids: torch.Tensor, pitch_ids: torch.Tensor):
+        """
+        Args:
+            yaw_ids: [B] yaw token IDs
+            pitch_ids: [B] pitch token IDs
+        Returns:
+            yaw_tok: [B, D] yaw embedding
+            pitch_tok: [B, D] pitch embedding
+            action_vec: [B, D] fused action vector (for single action token compatibility)
+        """
         yaw_tok = self.yaw_embed(yaw_ids)      # [B, D]
         pitch_tok = self.pitch_embed(pitch_ids)  # [B, D]
         concat = torch.cat([yaw_tok, pitch_tok], dim=-1)
-        action_vec = self.mlp(concat)          # 融合向量（用于单一动作 token 兼容现有流程）
+        action_vec = self.mlp(concat)          # Fused vector (for single action token compatibility with existing flow)
 
-        # 返回分轴向量与融合向量
+        # Return separate axis vectors and fused vector
         return yaw_tok, pitch_tok, action_vec
 
 
 class SplitActionRMSNorm(nn.Module):
     """
-    分轴动作调制版 RMSNorm (FiLM)：
-    - yaw_vec、pitch_vec 分别产生 (gamma, beta)，再做简单平均聚合；
-    - 可保持与单一动作向量相同的接口效果，但更强调轴向信息。
-    x: [B, L, D]; yaw_vec/pitch_vec: [B, D]
+    Split-axis action-conditioned RMSNorm (FiLM-style):
+    - yaw_vec, pitch_vec separately produce (gamma, beta), then simple average fusion
+    - Can maintain same interface effect as single action vector, but emphasizes axis info
+    
+    Args:
+        x: [B, L, D] input features
+        yaw_vec/pitch_vec: [B, D] action embeddings
     """
     def __init__(self, hidden_size: int):
         super().__init__()
@@ -66,6 +83,11 @@ class SplitActionRMSNorm(nn.Module):
 
 
 class EncoderAttention(nn.Module):
+    """
+    Multi-head self-attention with RoPE and grouped-query attention.
+    Applies RoPE only to image tokens (skips action tokens).
+    """
+    
     def __init__(self, hidden_size, head_num, kv_head_num, head_dim):
         super().__init__()
         self.hidden_size = hidden_size
@@ -91,6 +113,12 @@ class EncoderAttention(nn.Module):
         nn.init.xavier_uniform_(self.o_proj.weight, gain=1 / math.sqrt(2))
 
     def forward(self, inputs):
+        """
+        Args:
+            inputs: [B, L, D] where L = 1 (action) + num_img_tokens
+        Returns:
+            [B, L, D] attention output
+        """
         input_shape = inputs.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -98,6 +126,7 @@ class EncoderAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(inputs).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(inputs).view(hidden_shape).transpose(1, 2)
 
+        # Apply RoPE only to image tokens (skip action token at position 0)
         B, H_q, L, D = query_states.shape
         L_img = L - 1
         if L_img > 0:
@@ -111,6 +140,7 @@ class EncoderAttention(nn.Module):
                 num_action_tokens=1,
             )
 
+        # Expand KV heads for grouped-query attention
         key_states = repeat_kv(key_states, self.head_num // self.kv_head_num)
         value_states = repeat_kv(value_states, self.head_num // self.kv_head_num)
 
@@ -127,9 +157,9 @@ class EncoderAttention(nn.Module):
 
 class ActionCrossAttention(nn.Module):
     """
-    轻量动作→图像 Cross-Attention（残差用）：
-    - q: 图像 tokens [B, L_img, D]
-    - k,v: 动作 tokens（建议用 [yaw_vec, pitch_vec] 堆叠成 2 个 token）[B, 2, D]
+    Lightweight action->image Cross-Attention (residual):
+    - q: image tokens [B, L_img, D]
+    - k,v: action tokens (recommend using [yaw_vec, pitch_vec] stacked as 2 tokens) [B, 2, D]
     heads=2, dropout=0.1
     """
     def __init__(self, hidden_size: int, num_heads: int = 2, dropout: float = 0.1):
@@ -151,7 +181,13 @@ class ActionCrossAttention(nn.Module):
         nn.init.xavier_uniform_(self.o_proj.weight)
 
     def forward(self, img_tokens: torch.Tensor, act_tokens: torch.Tensor) -> torch.Tensor:
-        # img_tokens: [B, L, D], act_tokens: [B, 2, D]
+        """
+        Args:
+            img_tokens: [B, L, D]
+            act_tokens: [B, 2, D]
+        Returns:
+            [B, L, D] cross-attention output
+        """
         B, L, D = img_tokens.shape
         _, A, _ = act_tokens.shape  # A=2
         q = self.q_proj(img_tokens).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)   # [B, H, L, d]
@@ -167,6 +203,8 @@ class ActionCrossAttention(nn.Module):
 
 
 class EncoderFFN(nn.Module):
+    """Gated FFN (SwiGLU-style) for encoder."""
+    
     def __init__(self, hidden_size):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, hidden_size * 4, bias=False)
@@ -188,14 +226,22 @@ class EncoderFFN(nn.Module):
 
 
 class EncoderBlock(nn.Module):
+    """
+    Encoder transformer block with:
+    - Split-axis action conditioning
+    - Action->image cross-attention
+    - Self-attention with RoPE
+    - Gated residual connections
+    """
+    
     def __init__(self, hidden_size, head_num, kv_head_num, head_dim):
         super().__init__()
         self.attn = EncoderAttention(hidden_size, head_num, kv_head_num, head_dim)
         self.ffn = EncoderFFN(hidden_size)
-        # 分轴动作调制归一化 + 残差门控（由动作控制）
+        # Split-axis action conditioning normalization + residual gating (controlled by action)
         self.pre_norm = SplitActionRMSNorm(hidden_size)
         self.post_norm = SplitActionRMSNorm(hidden_size)
-        # 轻量 Cross-Attention（动作→图像）与其归一化
+        # Lightweight Cross-Attention (action->image) and its normalization
         self.cross_norm = SplitActionRMSNorm(hidden_size)
         self.act_cross_attn = ActionCrossAttention(hidden_size, num_heads=2, dropout=0.1)
         self.gate_attn = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -206,7 +252,15 @@ class EncoderBlock(nn.Module):
         nn.init.zeros_(self.gate_ffn.bias)
 
     def forward(self, inputs, yaw_vec, pitch_vec):
-        # 先做动作→图像的 Cross-Attention（残差）
+        """
+        Args:
+            inputs: [B, 1+L_img, D] concatenated action + image tokens
+            yaw_vec: [B, D] yaw action embedding
+            pitch_vec: [B, D] pitch action embedding
+        Returns:
+            [B, 1+L_img, D] transformed tokens
+        """
+        # First do action->image Cross-Attention (residual)
         a_tok = torch.stack([yaw_vec, pitch_vec], dim=1)  # [B, 2, D]
         img = inputs[:, 1:, :]  # [B, L_img, D]
         x_img = img
@@ -215,16 +269,16 @@ class EncoderBlock(nn.Module):
         img = x_img + h_img
         inputs = torch.cat([inputs[:, :1, :], img], dim=1)
 
-        # 注意力子层
+        # Attention sublayer
         x = inputs
         h = self.pre_norm(inputs, yaw_vec, pitch_vec)
         h = self.attn(h)
-        # 残差门控：使用分轴向量的平均作为门控输入
+        # Residual gating: use average of split-axis vectors as gate input
         a_avg = 0.5 * (yaw_vec + pitch_vec)
         g = torch.sigmoid(self.gate_attn(a_avg)).unsqueeze(1)  # [B,1,D]
         inputs = x + g * h
 
-        # FFN 子层
+        # FFN sublayer
         x = inputs
         h = self.post_norm(inputs, yaw_vec, pitch_vec)
         h = self.ffn(h)
@@ -234,6 +288,11 @@ class EncoderBlock(nn.Module):
 
 
 class Encoder(nn.Module):
+    """
+    Main encoder with action-conditioned transformer blocks.
+    Processes concatenated action + image tokens.
+    """
+    
     def __init__(self, head_num, kv_head_num, head_dim, hidden_size, num_yaw, num_pitch, num_layers):
         super().__init__()
         self.action_embed = ActionEmbedding(num_yaw=num_yaw, num_pitch=num_pitch, hidden_size=hidden_size)
@@ -243,20 +302,26 @@ class Encoder(nn.Module):
         self.post_norm = nn.RMSNorm(hidden_size, eps=1e-6)
 
     def forward(self, inputs, actions):
-        # encode action tokens
+        """
+        Args:
+            inputs: [B, L, D] image tokens from ConvNeXt
+            actions: [B, 2] action token IDs (yaw_id, pitch_id)
+        Returns:
+            [B, 1+L, D] encoded tokens (action + image)
+        """
+        # Encode action tokens
         yaw_ids, pitch_ids = actions[:, 0].long(), actions[:, 1].long()
         yaw_vec, pitch_vec, action_vec = self.action_embed(yaw_ids, pitch_ids)   # [B, D] x3
         action_tokens = action_vec.unsqueeze(1)
 
-        # concat action + image: [B, 2 + H*W, hidden_size]
-        # tokens = action_tokens + inputs
+        # Concatenate action + image: [B, 1 + L, hidden_size]
         tokens = torch.cat([action_tokens, inputs], dim=1)
 
-        # encode
+        # Encode through transformer blocks
         for blk in self.blocks:
             tokens = blk(tokens, yaw_vec, pitch_vec)
 
-        # normalize
+        # Final normalization
         tokens = self.post_norm(tokens)
 
         return tokens

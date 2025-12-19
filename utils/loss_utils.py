@@ -7,6 +7,13 @@ def variance_term(z: torch.Tensor, eps: float, gamma: float = 1.0):
     Encourage per-dimension std >= gamma (default 1.0).
     Using a slightly smaller gamma (e.g., 0.9) can stabilize training with small batches
     or when LayerNorm is applied before.
+    
+    Args:
+        z: [B, D] feature tensor
+        eps: epsilon for numerical stability
+        gamma: target minimum standard deviation
+    Returns:
+        variance loss (lower is better)
     """
     var = z.var(dim=0, unbiased=False)
     std = torch.sqrt(var + eps)
@@ -14,6 +21,17 @@ def variance_term(z: torch.Tensor, eps: float, gamma: float = 1.0):
 
 
 def covariance_term(z: torch.Tensor, B: int, D: int):
+    """
+    Off-diagonal covariance regularization.
+    Encourages decorrelation between different dimensions.
+    
+    Args:
+        z: [B, D] feature tensor
+        B: batch size
+        D: feature dimension
+    Returns:
+        covariance loss (lower is better)
+    """
     z = z - z.mean(dim=0, keepdim=True)
 
     denom = max(B - 1, 1)
@@ -26,8 +44,14 @@ def covariance_term(z: torch.Tensor, B: int, D: int):
 def correlation_term(z: torch.Tensor, eps: float = 1e-4):
     """
     Off-diagonal energy of the correlation matrix (batch-standardized features).
-    对每个维度做批内标准化后再计算相关矩阵的离对角能量，
-    相比协方差更稳定，数值尺度可控，适合作为去相关正则。
+    More stable than covariance, numerically well-scaled, suitable for decorrelation regularization.
+    Standardizes each dimension across the batch, then computes correlation matrix energy.
+    
+    Args:
+        z: [B, D] feature tensor
+        eps: epsilon for numerical stability
+    Returns:
+        correlation loss (lower is better)
     """
     z = z - z.mean(dim=0, keepdim=True)
     std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)
@@ -44,11 +68,16 @@ def barlow_correlation_loss(z: torch.Tensor,
                             lambda_offdiag: float = 1.0,
                             lambda_diag: float = 1.0):
     """
-    Barlow Twins 风格的去相关正则：
-    对标准化后的相关矩阵 corr，最小化 (corr - I)^2 的对角与离对角两部分。
-    - lambda_offdiag: 离对角权重
-    - lambda_diag: 对角(与 1 的偏差)权重
-    返回：标量 loss
+    Barlow Twins-style decorrelation regularization.
+    Minimizes (corr - I)^2 for both diagonal and off-diagonal parts of correlation matrix.
+    
+    Args:
+        z: [B, D] feature tensor
+        eps: epsilon for numerical stability
+        lambda_offdiag: weight for off-diagonal terms
+        lambda_diag: weight for diagonal terms (deviation from 1)
+    Returns:
+        scalar loss
     """
     z = z - z.mean(dim=0, keepdim=True)
     std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)
@@ -74,6 +103,19 @@ def vic_loss(z1: torch.Tensor,
     """
     VICReg-style loss with configurable variance threshold and optional
     online-only regularization (recommended when target is stop-grad + normalized).
+    
+    Args:
+        z1: [B, D] online branch features
+        z2: [B, D] target branch features
+        sim_coeff: weight for similarity loss
+        var_coeff: weight for variance loss
+        cov_coeff: weight for covariance loss
+        eps: epsilon for numerical stability
+        gamma: minimum std target
+        online_only_reg: if True, only regularize online branch (z1)
+    Returns:
+        total: weighted sum of losses
+        stats: dict with individual loss components
     """
     B, D = z1.shape
 
@@ -108,9 +150,16 @@ def vic_loss(z1: torch.Tensor,
 
 def byol_loss(z1: torch.Tensor, z2: torch.Tensor):
     """
-    简化版 BYOL 损失：对归一化后的向量做 MSE（等价于余弦距离的线性变换），
-    仅返回 sim（越小越好）。
-    适用于我们已采用 EMA teacher 的场景，作为最小稳定器，便于精简 Stage-1。
+    Simplified BYOL loss: MSE between normalized vectors (equivalent to cosine distance).
+    Returns only sim (lower is better).
+    Suitable for scenarios already using EMA teacher, as minimal stabilizer for Stage-1.
+    
+    Args:
+        z1: [B, D] online branch features
+        z2: [B, D] target branch features
+    Returns:
+        loss: scalar similarity loss
+        stats: dict with sim loss
     """
     z1_n = torch.nn.functional.normalize(z1, dim=-1)
     z2_n = torch.nn.functional.normalize(z2, dim=-1)

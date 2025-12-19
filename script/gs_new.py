@@ -38,7 +38,7 @@ def render_gaussians_single_cam(means: torch.Tensor,      # [N, 3]
                                 K: torch.Tensor,          # [3, 3]
                                 H: int,
                                 W: int):
-    # 归一化 quaternion
+    # Normalize quaternion
     quats_normed = quats / quats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
     render_colors, render_alphas, meta = gsplat.rasterization(
@@ -54,11 +54,11 @@ def render_gaussians_single_cam(means: torch.Tensor,      # [N, 3]
         packed=False
     )
 
-    # 返回 [H, W, D] / [H, W, 1]
+    # Return [H, W, D] / [H, W, 1]
     return render_colors[0], render_alphas[0], meta
 
 
-# =============== 仅用于测试的小工具（带 encoder 先验的初始化） ===============
+# =============== Testing utilities (with encoder prior initialization) ===============
 
 def _init_random_gaussians(num_points: int,
                            device: str = "cuda",
@@ -70,7 +70,7 @@ def _init_random_gaussians(num_points: int,
     scales = torch.rand(num_points, 3, device=device)
     colors = torch.rand(num_points, color_dim, device=device)
 
-    # 随机 quaternion
+    # Random quaternion
     u = torch.rand(num_points, 1, device=device)
     v = torch.rand(num_points, 1, device=device)
     w = torch.rand(num_points, 1, device=device)
@@ -100,13 +100,13 @@ def _init_gaussians_with_encoder_prior(view_img: torch.Tensor,   # [3,H,W]
                                        ckpt_path: str = "../data/checkpoint/jepa_model_stage1_fixed.pth",
                                        prior_length: int = 2):
     """
-    最小改动版：使用 Stage-1 的 convnext 特征做显著性先验，
-    仅用于初始化高斯点（主训练/渲染循环不变）。
+    Minimal modification version: uses Stage-1 convnext features for saliency prior,
+    only for initializing Gaussian points (main training/rendering loop unchanged).
     """
     from model.JEPA import JEPAModel
 
     device = torch.device(device)
-    # 1) 加载 Stage-1 模型（只用 convnext）
+    # 1) Load Stage-1 model (only use convnext)
     jepa = JEPAModel(
         hidden_size=1024,
         head_dim=128,
@@ -124,27 +124,27 @@ def _init_gaussians_with_encoder_prior(view_img: torch.Tensor,   # [3,H,W]
         for p in jepa.parameters():
             p.requires_grad_(False)
     except Exception as e:
-        # 最小改动：如果 JEPA 权重不可用，退回到 torchvision convnext 的特征
-        print(f"[ENC_PRIOR][WARN] 加载 Stage-1 失败，改用 torchvision convnext 特征。原因: {e}")
+        # Minimal modification: if JEPA weights unavailable, fall back to torchvision convnext features
+        print(f"[ENC_PRIOR][WARN] Failed to load Stage-1, using torchvision convnext features. Reason: {e}")
         use_jepa = False
         import torchvision
         from torchvision.models import ConvNeXt_Base_Weights
         conv = torchvision.models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT).features.to(device)
         conv.eval()
 
-    # 2) 显著性：优先用 encoder 的图像 tokens（引入 action 序列的前 K 步），否则退回 convnext 通道能量
+    # 2) Saliency: prioritize encoder's image tokens (introducing first K steps of action sequence), otherwise fallback to convnext channel energy
     with torch.no_grad():
         if use_jepa:
-            # convnext → 图像 tokens
+            # convnext → image tokens
             feat = jepa.convnext(view_img[None].to(device))           # [1,C,h,w]
             B, C, h, w = feat.shape
             L = h * w
             x_prev = feat.view(B, C, L).transpose(1, 2)               # [1,L,D]
 
-            # 引入 action：取前 prior_length 步的动作序列（与 Stage-1 的顺序一致），累计显著性
+            # Introduce action: take first prior_length steps of action sequence (consistent with Stage-1 order), accumulate saliency
             from utils.action_utils import ActionTokenizer, build_action_tensor
             tok = ActionTokenizer()
-            action_seq = build_action_tensor()                         # [T,2] 连续视角差分（float）
+            action_seq = build_action_tensor()                         # [T,2] continuous view differences (float)
             actions_ids = tok.encode_sequence(action_seq, batch_size=1, device=device)  # [1,T,2] (long)
 
             K_steps = int(min(prior_length, actions_ids.size(1)))
@@ -155,7 +155,7 @@ def _init_gaussians_with_encoder_prior(view_img: torch.Tensor,   # [3,H,W]
                 img_tok = tokens_all[:, 1:, :]                          # [1,L,D]
                 sal_t = img_tok.pow(2).sum(dim=-1).view(1, 1, h, w)     # [1,1,h,w]
                 sal_acc = sal_acc + sal_t
-                x_prev = img_tok.detach()                               # 与 Stage-1 对齐
+                x_prev = img_tok.detach()                               # Align with Stage-1
 
             sal = F.interpolate(sal_acc, size=view_img.shape[1:], mode="bilinear", align_corners=False)[0, 0]
             sal = (sal - sal.min()) / (sal.max() - sal.min() + 1e-6)
@@ -165,7 +165,7 @@ def _init_gaussians_with_encoder_prior(view_img: torch.Tensor,   # [3,H,W]
             sal = F.interpolate(sal, size=view_img.shape[1:], mode="bilinear", align_corners=False)[0, 0]
             sal = (sal - sal.min()) / (sal.max() - sal.min() + 1e-6)
 
-    # 3) 依据显著性抽样 N 个像素位置
+    # 3) Sample N pixel locations based on saliency
     H, W = view_img.shape[1:]
     p = (sal + 1e-6).flatten()
     p = p / p.sum()
@@ -173,26 +173,26 @@ def _init_gaussians_with_encoder_prior(view_img: torch.Tensor,   # [3,H,W]
     ys = (idx // W).float()
     xs = (idx % W).float()
 
-    # 4) 反投影到世界系（采用适中的初始深度范围）
+    # 4) Backproject to world coordinates (using moderate initial depth range)
     d = torch.empty(num_points, device=device).uniform_(1.0, 3.0)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     X = (xs - cx) / fx * d
     Y = (ys - cy) / fy * d
     Z = d
     p_cam = torch.stack([X, Y, Z, torch.ones_like(Z)], dim=-1)  # [N,4]
-    # 注意：数据里保存的是 cam.matrix_world（cam->world）
+    # Note: data stores cam.matrix_world (cam->world)
     means_h = (view_cam.to(device) @ p_cam.t()).t()
     means = means_h[:, :3].contiguous()
 
-    # 5) 其他参数的先验初始化（稳健起步）
-    # quats：单位朝向
+    # 5) Prior initialization for other parameters (stable start)
+    # quats: unit orientation
     quats = torch.zeros(num_points, 4, device=device)
     quats[:, 3] = 1.0
-    # scales：小范围，避免一开始就大面片
-    scales = torch.full((num_points, 3), 0.05, device=device)  # 常值也可
-    # opacities：logit=0 → alpha≈0.5
+    # scales: small range, avoid starting with large patches
+    scales = torch.full((num_points, 3), 0.05, device=device)  # constant is also fine
+    # opacities: logit=0 → alpha≈0.5
     opacities = torch.zeros(num_points, device=device)
-    # colors：用 GT 像素颜色做 inverse-sigmoid 作为初值（贴近渲染域）
+    # colors: use GT pixel colors with inverse-sigmoid as initial value (close to rendering domain)
     gt = view_img.permute(1, 2, 0).to(device)  # [H,W,3]
     rgb = gt[ys.long(), xs.long()].clamp(1e-3, 1 - 1e-3)  # [N,3]
     colors = torch.log(rgb / (1 - rgb))
@@ -200,16 +200,16 @@ def _init_gaussians_with_encoder_prior(view_img: torch.Tensor,   # [3,H,W]
     for t in (means, scales, colors, quats, opacities):
         t.requires_grad_(True)
 
-    print("[ENC_PRIOR] 使用 Encoder 先验完成初始化")
+    print("[ENC_PRIOR] Initialization completed using Encoder prior")
     return means, quats, scales, opacities, colors
 
 def _rotmat3_to_quat_xyzw(R: torch.Tensor) -> torch.Tensor:
     """
-    将 3x3 旋转矩阵转换为四元数 (x,y,z,w)，w 在最后。
-    输入：R [...,3,3]
-    输出：q [...,4]，格式 [x,y,z,w]
+    Convert 3x3 rotation matrix to quaternion (x,y,z,w), w at the end.
+    Input: R [...,3,3]
+    Output: q [...,4], format [x,y,z,w]
     """
-    # 参考自经典实现，数值上做 clamping
+    # Reference from classic implementation, with numerical clamping
     eps = 1e-8
     r00 = R[..., 0, 0]
     r11 = R[..., 1, 1]
@@ -228,7 +228,7 @@ def _rotmat3_to_quat_xyzw(R: torch.Tensor) -> torch.Tensor:
     qy_pos = (R[..., 0, 2] - R[..., 2, 0]) / (S + eps)
     qz_pos = (R[..., 1, 0] - R[..., 0, 1]) / (S + eps)
 
-    # 分支：r00 是最大对角项
+    # Branch: r00 is the largest diagonal element
     cond1 = (r00 > r11) & (r00 > r22)
     S1 = torch.sqrt(torch.clamp(1.0 + r00 - r11 - r22, min=eps)) * 2.0  # S=4*qx
     qw_1 = (R[..., 2, 1] - R[..., 1, 2]) / (S1 + eps)
@@ -236,7 +236,7 @@ def _rotmat3_to_quat_xyzw(R: torch.Tensor) -> torch.Tensor:
     qy_1 = (R[..., 0, 1] + R[..., 1, 0]) / (S1 + eps)
     qz_1 = (R[..., 0, 2] + R[..., 2, 0]) / (S1 + eps)
 
-    # 分支：r11 最大
+    # Branch: r11 largest
     cond2 = ~cond1 & (r11 > r22)
     S2 = torch.sqrt(torch.clamp(1.0 + r11 - r00 - r22, min=eps)) * 2.0  # S=4*qy
     qw_2 = (R[..., 0, 2] - R[..., 2, 0]) / (S2 + eps)
@@ -244,21 +244,21 @@ def _rotmat3_to_quat_xyzw(R: torch.Tensor) -> torch.Tensor:
     qy_2 = 0.25 * S2
     qz_2 = (R[..., 1, 2] + R[..., 2, 1]) / (S2 + eps)
 
-    # 分支：r22 最大
+    # Branch: r22 largest
     S3 = torch.sqrt(torch.clamp(1.0 + r22 - r00 - r11, min=eps)) * 2.0  # S=4*qz
     qw_3 = (R[..., 1, 0] - R[..., 0, 1]) / (S3 + eps)
     qx_3 = (R[..., 0, 2] + R[..., 2, 0]) / (S3 + eps)
     qy_3 = (R[..., 1, 2] + R[..., 2, 1]) / (S3 + eps)
     qz_3 = 0.25 * S3
 
-    # 组合分支
-    # 首先 trace>0 用 pos 分支
+    # Combine branches
+    # First trace>0 uses pos branch
     qw = torch.where(cond, qw_pos, qw)
     qx = torch.where(cond, qx_pos, qx)
     qy = torch.where(cond, qy_pos, qy)
     qz = torch.where(cond, qz_pos, qz)
 
-    # trace<=0，再根据最大对角选择 1/2/3 分支
+    # trace<=0, then choose 1/2/3 branch based on largest diagonal
     qw = torch.where(~cond & cond1, qw_1, qw)
     qx = torch.where(~cond & cond1, qx_1, qx)
     qy = torch.where(~cond & cond1, qy_1, qy)
@@ -275,18 +275,18 @@ def _rotmat3_to_quat_xyzw(R: torch.Tensor) -> torch.Tensor:
     qz = torch.where(~cond & ~cond1 & ~cond2, qz_3, qz)
 
     q = torch.stack([qx, qy, qz, qw], dim=-1)
-    # 归一化
+    # Normalize
     q = q / (q.norm(dim=-1, keepdim=True).clamp(min=1e-8))
     return q
 
 def _quat_mul_xyzw(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     """
-    四元数乘法（左乘）：q = q1 ⊗ q2，输入/输出格式均为 [x, y, z, w]。
-    支持广播：q1 [...,4], q2 [...,4] → q [...,4]
+    Quaternion multiplication (left multiply): q = q1 ⊗ q2, input/output format both [x, y, z, w].
+    Supports broadcasting: q1 [...,4], q2 [...,4] → q [...,4]
     """
     x1, y1, z1, w1 = q1.unbind(-1)
     x2, y2, z2, w2 = q2.unbind(-1)
-    # v = (x, y, z), w 为标量（最后一维）
+    # v = (x, y, z), w is scalar (last dimension)
     x = w1 * x2 + w2 * x1 + y1 * z2 - z1 * y2
     y = w1 * y2 + w2 * y1 + z1 * x2 - x1 * z2
     z = w1 * z2 + w2 * z1 + x1 * y2 - y1 * x2
@@ -303,10 +303,10 @@ def _render_views_grid(means: torch.Tensor,
                        cams: torch.Tensor,   # [T,4,4] cam->world
                        K: torch.Tensor,      # [3,3]
                        view_ids: list,
-                       imgs: torch.Tensor,   # [T,3,H,W] 可为 None（无 GT）
+                       imgs: torch.Tensor,   # [T,3,H,W] can be None (no GT)
                        save_path: str,
                        device: torch.device):
-    """将若干视角的 GT 与 Pred 拼网格保存。Pred 在前，GT 在后，两列为一组。"""
+    """Stitch GT and Pred for multiple views into a grid and save. Pred first, GT second, two columns per group."""
     tiles = []
     H = imgs.shape[-2] if imgs is not None else 256
     W = imgs.shape[-1] if imgs is not None else 256
@@ -345,40 +345,40 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
                            render_view_ids: Optional[List[int]] = None,
                            render_save_path: str = "./vis/3dgs_infer_multiview.png"):
     """
-    小测试（单视角）：
-      1. 从 ShapeNetDataset 里拿一张图 + 相机
-      2. 用“随机初始化”或“Encoder 先验初始化”一堆 Gaussians
-      3. 渲染→MSE 拟合 GT
-      4. 保存 GT vs Rendered 对比图到 save_path
+    Small test (single view):
+      1. Take one image + camera from ShapeNetDataset
+      2. Use "random initialization" or "Encoder prior initialization" for a bunch of Gaussians
+      3. Render → MSE fit to GT
+      4. Save GT vs Rendered comparison image to save_path
     """
     device = torch.device(device)
 
-    # 1. 取一个样本：imgs: [B, T, 3, H, W], cams: [B, T, 4, 4]
+    # 1. Take one sample: imgs: [B, T, 3, H, W], cams: [B, T, 4, 4]
     ds = ShapeNetDataset(root=root,
                          split=split,
                          return_cam=True,
-                         return_obj=True,  # 加载对象矩阵以做姿态补偿
+                         return_obj=True,  # Load object matrix for pose compensation
                          max_objs_per_synset=1,
-                         synsets=["02958343"])  # 仅汽车类
+                         synsets=["02958343"])  # Cars only
     loader = DataLoader(ds, batch_size=1, shuffle=False)
-    # 新返回格式：images, cams, objs, meta
+    # New return format: images, cams, objs, meta
     batch = next(iter(loader))
     if len(batch) == 4:
         imgs, cams, objs, meta = batch
     else:
-        # 兼容旧返回（无 obj 矩阵时退化为单位矩阵）
+        # Compatible with old return (degrades to identity when no obj matrix)
         imgs, cams, meta = batch
         T_tmp = cams.shape[0]
         objs = torch.stack([torch.eye(4) for _ in range(T_tmp)], dim=0)
 
-    # 去掉 batch 维度
+    # Remove batch dimension
     imgs = imgs[0]   # [T, 3, H, W]
     cams = cams[0]   # [T, 4, 4]
     objs = objs[0]   # [T, 4, 4]
 
-    # 选一个视角 t = 0 用于 prior 初始化（训练时将使用多视角监督）
+    # Select a view t = 0 for prior initialization (training will use multi-view supervision)
     view_img = imgs[0].to(device)   # [3, H, W]
-    view_cam = cams[0].to(device)   # [4, 4]（注意：cam->world）
+    view_cam = cams[0].to(device)   # [4, 4] (Note: cam->world)
     _, H, W = view_img.shape
 
     # ground truth: [H, W, 3]
@@ -388,17 +388,17 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
     print(f"[INFO] view_cam.shape = {view_cam.shape}")
     print(f"[INFO] meta = {meta}")
 
-    # 2. 相机内参：改回基于 FOV 的形式（与原版保持一致）
+    # 2. Camera intrinsics: revert to FOV-based form (keep consistent with original)
     K = make_intrinsics_from_fov(H, W, device=device)
 
-    # 3. 初始化 Gaussians（优先用 Encoder 先验，失败则回退随机）
+    # 3. Initialize Gaussians (prioritize Encoder prior, fallback to random on failure)
     if use_encoder_prior:
         try:
             means, quats, scales, opacities, colors = _init_gaussians_with_encoder_prior(
                 view_img, view_cam, K, num_points, device, prior_length=4
             )
         except Exception as e:
-            print(f"[WARN] 使用 Encoder 先验初始化失败，改用随机初始化。原因: {e}")
+            print(f"[WARN] Failed to initialize with Encoder prior, using random initialization. Reason: {e}")
             means, quats, scales, opacities, colors = _init_random_gaussians(
                 num_points=num_points,
                 device=device,
@@ -417,7 +417,7 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
     )
     mse_loss = nn.MSELoss()
 
-    # 推理路径：仅用单视角 t0 优化若干步，然后渲染多视角
+    # Inference path: only optimize on single view t0 for several steps, then render multi-view
     if eval_only:
         print("[EVAL] Single-view optimization on t0, then render multi-view...")
         for ei in range(eval_iters):
@@ -432,7 +432,7 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
             if ei % 50 == 0 or ei == eval_iters - 1:
                 print(f"[EVAL-ITER {ei:03d}] loss0={loss0.item():.4f}")
 
-        # 渲染多视角：默认选 [0, 8] 或 [0, 1]
+        # Render multi-view: default select [0, 8] or [0, 1]
         T_all = imgs.shape[0]
         if render_view_ids is None:
             render_view_ids = [0]
@@ -445,18 +445,18 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
         )
         return
 
-    # 训练目标：基于一个 input（t0），生成两个 view（t0 与 t1），并用两视角联合监督
+    # Training objective: based on one input (t0), generate two views (t0 and t1), and supervise with both views
     for it in range(iters):
         optimizer.zero_grad()
 
-        # 视角集合与 encoder prior 一致：t=0 与 t=1（若 T==1 则退化为单视角）
+        # View set consistent with encoder prior: t=0 and t=1 (degrades to single view if T==1)
         T_all = imgs.shape[0]
         idx_list = [0] if T_all == 1 else list(range(min(4, T_all)))
 
         photo = 0.0
         per_view_losses = []
 
-        # 对象姿态补偿：将 t0 姿态下学习到的点，变换到目标视角 t 的对象姿态
+        # Object pose compensation: transform points learned in t0 pose to target view t's object pose
         obj0 = objs[0].to(device)
         obj0_inv = torch.linalg.inv(obj0)
 
@@ -474,7 +474,7 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
             means_t_h = (delta @ means_h.t()).t()      # [N,4]
             means_t = means_t_h[:, :3]
 
-            # quats_t = q_delta ⊗ quats （四元数左乘），使椭球朝向随对象旋转
+            # quats_t = q_delta ⊗ quats (quaternion left multiply), rotate ellipsoid orientation with object
             R_delta = delta[:3, :3].unsqueeze(0)       # [1,3,3]
             q_delta = _rotmat3_to_quat_xyzw(R_delta)[0]  # [4]
             q_delta_expand = q_delta.unsqueeze(0).expand_as(quats)  # [N,4]
@@ -506,8 +506,8 @@ def _fit_one_shapenet_view(root: str = "../data/3D",
             else:
                 print(f"[ITER {it:03d}] loss={loss.item():.4f}")
 
-    # 4. 保存对比图 (GT | PRED)
-    # 保存两视角（或单视角）GT|Pred 拼图，动作/顺序与 prior 保持一致
+    # 4. Save comparison image (GT | PRED)
+    # Save two views (or single view) GT|Pred stitched image, action/order consistent with prior
     with torch.no_grad():
         tiles = []
         out_views = [0] if imgs.shape[0] == 1 else list(range(min(4, imgs.shape[0])))

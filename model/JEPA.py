@@ -12,6 +12,18 @@ from utils.loss_utils import byol_loss, variance_term, covariance_term, correlat
 
 
 class JEPAModel(nn.Module):
+    """
+    Stage-1 JEPA (Joint Embedding Predictive Architecture) model.
+    Learns view-invariant representations through self-supervised learning.
+    
+    Architecture:
+    - Frozen ConvNeXt backbone for feature extraction
+    - Encoder: processes image features with action conditioning
+    - Predictor: maps encoder output to target space
+    - Decoder: frozen ConvNeXt + normalization (target branch)
+    - EMA target projector for stability
+    """
+    
     def __init__(self, hidden_size, head_dim, head_num, kv_head_num, num_yaw, num_pitch, num_layers, momentum: float = 0.998):
         super().__init__()
         self.convnext = torchvision.models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT).features
@@ -29,7 +41,7 @@ class JEPAModel(nn.Module):
                                           proj_dim=hidden_size)
         self.decoder = Decoder()
 
-        # 强化防塌缩：目标投影头 + EMA teacher（不反传）
+        # Enhanced anti-collapse: target projector + EMA teacher (no backprop)
         self.target_projector = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
@@ -43,11 +55,13 @@ class JEPAModel(nn.Module):
             p.requires_grad_(False)
 
     def train(self, mode: bool = True):
+        """Keep ConvNeXt frozen in eval mode."""
         super().train(mode)
         self.convnext.eval()
         return self
 
     def _init_projector(self, module: nn.Module):
+        """Initialize target projector weights."""
         for m in module.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -56,13 +70,25 @@ class JEPAModel(nn.Module):
 
     @torch.no_grad()
     def _ema_update(self):
+        """Update EMA target projector."""
         m = self.momentum
         for p_ema, p in zip(self.target_projector_ema.parameters(), self.target_projector.parameters()):
             p_ema.data.mul_(m).add_(p.data, alpha=1 - m)
 
     def forward(self, images, actions):
+        """
+        Forward pass for Stage-1 training.
+        
+        Args:
+            images: [B, T, 3, H, W] sequence of images
+            actions: [B, T, 2] action token IDs
+        Returns:
+            total_loss: scalar training loss
+            stats: dict with loss components and monitoring metrics
+        """
         B, T, C, H, W = images.shape
 
+        # Extract initial features
         x0 = images[:, 0]
         with torch.no_grad():
             feat0 = self.convnext(x0)
@@ -71,7 +97,7 @@ class JEPAModel(nn.Module):
 
         total_loss = 0.0
         sim_list = []
-        # 为避免显存累积，这些统计用标量求和，不保留计算图
+        # To avoid memory accumulation, use scalar sums for statistics (no computation graph retention)
         v_online_sum = 0.0
         v_target_sum = 0.0
         std_online_sum = 0.0
@@ -83,40 +109,41 @@ class JEPAModel(nn.Module):
         if self.training:
             self._ema_update()
 
+        # Process each timestep
         for t in range(1, T):
             action = actions[:, t-1, :]
 
             tokens_all = self.encoder(x_prev, action)
             action_tok = tokens_all[:, :1, :]
             img_tok = tokens_all[:, 1:, :]
-            # 截断跨时间步的反向图，避免 BPTT 导致显存占用线性增长
+            # Cut backprop across time steps to avoid BPTT memory linear growth
             x_prev = img_tok.detach()
             z_online = self.predictor(tokens_all)
-            # Encoder-only pooled 表征（仅图像 tokens），用于在 Encoder 上直接施加防塌缩约束
+            # Encoder-only pooled representation (image tokens only), for direct anti-collapse constraints on Encoder
             enc_pooled = img_tok.mean(dim=1)  # [B, D]
 
             x_t = images[:, t]
-            # 目标侧：Decoder + target projector（在线/EMA），仅对 EMA 反向阻断
+            # Target side: Decoder + target projector (online/EMA), only stop-grad on EMA backprop
             feat_t = self.decoder(x_t)  # [B, D]
             z_target_online = self.target_projector(feat_t)
             with torch.no_grad():
                 z_target_ema = self.target_projector_ema(feat_t)
 
-            # 主损失：VICReg 风格（在线分支 var+cov 正则，目标对齐 EMA）
-            # 强化去相关，避免 cov_online 飙升；同时控制方差不过度增大
+            # Main loss: VICReg style (online branch var+cov regularization, target aligned with EMA)
+            # Enhanced decorrelation to avoid cov_online explosion; also control variance from over-expansion
             loss_t, stats_t = vic_loss(
                 z_online, z_target_ema,
                 sim_coeff=25.0, var_coeff=25.0, cov_coeff=10.0,
                 eps=1e-4, gamma=0.9, online_only_reg=True
             )
-            # 在 Encoder 本身落防塌缩（无 sim，不触 GT）：方差 + 去相关（相关矩阵口径，尺度无关）
+            # Anti-collapse on Encoder itself (no sim, doesn't touch GT): variance + decorrelation (correlation matrix off-diagonal, scale-invariant)
             loss_t = loss_t + 10.0 * variance_term(enc_pooled, eps=1e-4, gamma=0.9)
             loss_t = loss_t + 5e-3 * correlation_term(enc_pooled)
             total_loss = total_loss + loss_t
 
             sim_list.append(stats_t["sim"])
 
-            # 额外统计用于日志与 collapse 监测（不参与主损，且在 no_grad 下避免显存累积）
+            # Additional stats for logging and collapse monitoring (not part of main loss, in no_grad to avoid memory accumulation)
             with torch.no_grad():
                 v_online = variance_term(z_online, eps=1e-4, gamma=0.9).item()
                 v_target = variance_term(z_target_ema, eps=1e-4, gamma=0.9).item()
@@ -128,7 +155,7 @@ class JEPAModel(nn.Module):
                 corr_online = correlation_term(z_online).item()
                 corr_target = correlation_term(z_target_ema).item()
 
-                # 低秩指标（在线分支）
+                # Low-rank indicator (online branch)
                 zo = z_online - z_online.mean(dim=0, keepdim=True)
                 try:
                     S = torch.linalg.svdvals(zo)
@@ -142,7 +169,7 @@ class JEPAModel(nn.Module):
                 std_target_sum += std_target
                 cov_online_sum += cov_online
                 cov_target_sum += cov_target
-                # 累加相关矩阵离对角能量（用于日志）
+                # Accumulate correlation matrix off-diagonal energy (for logging)
                 try:
                     corr_online_sum
                 except NameError:
@@ -155,8 +182,7 @@ class JEPAModel(nn.Module):
         num_steps = T - 1
         total_loss = total_loss / num_steps
 
-        # 将标量均值打包为张量，便于统一 .item() 日志
-        # 将标量均值打包为张量，便于统一 .item() 日志
+        # Package scalar averages as tensors for unified .item() logging
         stats = {
             "loss": total_loss.detach(),
             "sim": torch.stack(sim_list).mean(),

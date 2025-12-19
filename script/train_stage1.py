@@ -15,7 +15,7 @@ from utils.dataset_utils import ShapeNetDataset
 # wandb login
 wandb.login(key="c607812d07dd287739ac6ae32c2be43cea6dc664")
 
-# train configuration
+# Training configuration
 hidden_size = 1024
 head_dim = 128
 head_num = 8
@@ -28,7 +28,7 @@ batch_size = 64
 lr = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# wandb project initialization
+# Wandb project initialization
 wandb.init(
     project="CV-JEPA-3DGS",
     name="jepa_run_001",
@@ -46,12 +46,12 @@ wandb.init(
 )
 
 """
-支持从已有 checkpoint 续训：
-- 优先使用包含优化器/调度器/步数等的 resume 文件（jepa_stage1_resume.pth）
-- 若不存在，则尝试仅加载模型权重文件（jepa_model_stage1_fixed.pth）
+Support resuming from existing checkpoint:
+- Priority: use resume file with optimizer/scheduler/steps (jepa_stage1_resume.pth)
+- Fallback: load model weights only (jepa_model_stage1_fixed.pth)
 """
 
-# model & optimizer initialization
+# Model & optimizer initialization
 jepa = JEPAModel(
     hidden_size=hidden_size,
     head_dim=head_dim,
@@ -64,18 +64,18 @@ jepa = JEPAModel(
 jepa.train()
 optimizer = torch.optim.AdamW(jepa.parameters(), lr=lr)
 
-# dataset initialization
+# Dataset initialization
 dataset = ShapeNetDataset(root="../data/3D", split="train", synsets=["02958343"])
 dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, shuffle=True, drop_last=True)
 scheduler = get_scheduler(name="cosine", optimizer=optimizer, num_warmup_steps=0, num_training_steps=epoch * len(dataloader))
 
-# checkpoint paths
+# Checkpoint paths
 ckpt_dir = os.path.join("..", "data", "checkpoint")
 os.makedirs(ckpt_dir, exist_ok=True)
 model_ckpt_path = os.path.join(ckpt_dir, "jepa_model_stage1_fixed.pth")
 resume_ckpt_path = os.path.join(ckpt_dir, "jepa_stage1_resume.pth")
 
-# try resume
+# Try to resume from checkpoint
 start_epoch = 0
 global_step = 0
 if os.path.exists(resume_ckpt_path):
@@ -103,12 +103,12 @@ elif os.path.exists(model_ckpt_path):
     except Exception as e:
         print(f"[RESUME] Failed to load model weights: {e}")
 
-# action initialization
+# Action initialization
 action_tokenizer = ActionTokenizer()
 action_sequence = build_action_tensor()
 action_tensor = action_tokenizer.encode_sequence(action_sequence, batch_size, device=device)
 
-# training loop
+# Training loop
 for ep in tqdm(range(start_epoch, epoch), leave=False):
     for batch in tqdm(dataloader, leave=False):
         imgs, meta = batch
@@ -154,7 +154,7 @@ for ep in tqdm(range(start_epoch, epoch), leave=False):
             ])
         )
 
-    # save checkpoint at end of each epoch
+    # Save checkpoint at end of each epoch
     save_state = {
         "model": jepa.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -166,7 +166,7 @@ for ep in tqdm(range(start_epoch, epoch), leave=False):
     torch.save(save_state, resume_ckpt_path)
     torch.save(jepa.state_dict(), model_ckpt_path)
 
-# final save (redundant but explicit)
+# Final save (redundant but explicit)
 final_state = {
     "model": jepa.state_dict(),
     "optimizer": optimizer.state_dict(),
