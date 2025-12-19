@@ -1,6 +1,5 @@
 import math
 import torch
-import torch.nn.functional as F
 import gsplat
 
 
@@ -15,37 +14,6 @@ def make_intrinsics_from_fov(H: int,
             [focal, 0.0,   W / 2.0],
             [0.0,   focal, H / 2.0],
             [0.0,   0.0,   1.0    ],
-        ],
-        device=device,
-        dtype=torch.float32,
-    )
-    return K
-
-
-def make_intrinsics_from_blender(H: int,
-                                 W: int,
-                                 device: str = "cuda",
-                                 lens_mm: float = 55.0,
-                                 sensor_width_mm: float = 36.0,
-                                 sensor_height_mm: float = 24.0) -> torch.Tensor:
-    """
-    根据 Blender 相机参数计算像素内参：
-    - fx = W * lens_mm / sensor_width_mm
-    - fy = H * lens_mm / sensor_height_mm
-    - cx = W/2, cy = H/2
-
-    默认参数与数据生成脚本保持一致：lens=55mm，sensor=36×24mm。
-    """
-    device = torch.device(device)
-    fx = float(W) * float(lens_mm) / float(sensor_width_mm)
-    fy = float(H) * float(lens_mm) / float(sensor_height_mm)
-    cx = float(W) / 2.0
-    cy = float(H) / 2.0
-    K = torch.tensor(
-        [
-            [fx, 0.0, cx],
-            [0.0, fy, cy],
-            [0.0, 0.0, 1.0],
         ],
         device=device,
         dtype=torch.float32,
@@ -79,35 +47,65 @@ def render_gaussians_single_cam(means: torch.Tensor, # [N, 3]
     return render_colors[0], render_alphas[0], meta
 
 
-# TODO
-def render_gaussians_batch(
-        means, quats, scales_raw,  # scales_raw是未处理的
-        opacity_logits, color_logits,
-        viewmats, Ks, H, W
-):
-    B, N, _ = means.shape
+def rotmat3_to_quat_xyzw(R: torch.Tensor):
+    m00, m01, m02 = R[..., 0, 0], R[..., 0, 1], R[..., 0, 2]
+    m10, m11, m12 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
+    m20, m21, m22 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
 
-    # 四元数归一化
-    quats_normed = F.normalize(quats, dim=-1)
+    q_abs = torch.stack([
+        1.0 + m00 + m11 + m22,
+        1.0 + m00 - m11 - m22,
+        1.0 - m00 + m11 - m22,
+        1.0 - m00 - m11 + m22,
+    ], dim=-1)
+    quat = torch.zeros(*R.shape[:-2], 4, device=R.device, dtype=R.dtype)
 
-    # 确保scales为正（这里scales_raw已经是softplus的输出）
-    scales = scales_raw.clamp(min=1e-4, max=10.0)  # 添加clamp防止极值
+    m = torch.argmax(q_abs, dim=-1, keepdim=True)
+    q_max = torch.gather(q_abs, -1, m).squeeze(-1)
+    m = m.squeeze(-1)
+    q_v = 0.5 * torch.sqrt(torch.maximum(q_max, torch.zeros_like(q_max)))
 
-    opacities = torch.sigmoid(opacity_logits)
-    colors = torch.sigmoid(color_logits)
+    idx = (m == 0)
+    if idx.any():
+        denom = 0.25 / q_v[idx]
+        quat[idx, 0] = (m12[idx] - m21[idx]) * denom
+        quat[idx, 1] = (m20[idx] - m02[idx]) * denom
+        quat[idx, 2] = (m01[idx] - m10[idx]) * denom
+        quat[idx, 3] = q_v[idx]
 
-    viewmats = viewmats.unsqueeze(1)
-    Ks = Ks.unsqueeze(1)
+    idx = (m == 1)
+    if idx.any():
+        denom = 0.25 / q_v[idx]
+        quat[idx, 0] = q_v[idx]
+        quat[idx, 1] = (m01[idx] + m10[idx]) * denom
+        quat[idx, 2] = (m20[idx] + m02[idx]) * denom
+        quat[idx, 3] = (m12[idx] - m21[idx]) * denom
 
-    render_colors, render_alphas, meta = gsplat.rasterization(
-        means,
-        quats_normed,
-        scales,
-        opacities,
-        colors,
-        viewmats,
-        Ks,
-        W, H,
-        packed=False
-    )
-    return render_colors[:, 0], render_alphas[:, 0], meta
+    idx = (m == 2)
+    if idx.any():
+        denom = 0.25 / q_v[idx]
+        quat[idx, 0] = (m01[idx] + m10[idx]) * denom
+        quat[idx, 1] = q_v[idx]
+        quat[idx, 2] = (m12[idx] + m21[idx]) * denom
+        quat[idx, 3] = (m20[idx] - m02[idx]) * denom
+
+    idx = (m == 3)
+    if idx.any():
+        denom = 0.25 / q_v[idx]
+        quat[idx, 0] = (m20[idx] + m02[idx]) * denom
+        quat[idx, 1] = (m12[idx] + m21[idx]) * denom
+        quat[idx, 2] = q_v[idx]
+        quat[idx, 3] = (m01[idx] - m10[idx]) * denom
+
+    return quat
+
+
+def quat_mul_xyzw(q1: torch.Tensor, q2: torch.Tensor):
+    x1, y1, z1, w1 = q1.unbind(-1)
+    x2, y2, z2, w2 = q2.unbind(-1)
+    return torch.stack([
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ], dim=-1)
