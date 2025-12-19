@@ -10,6 +10,7 @@ from utils.gs_utils import make_intrinsics_from_fov, render_gaussians_single_cam
 
 
 # configuration
+seed = 42
 root = "../data/3D"
 split = "test"
 synsets = ["02958343"]
@@ -18,6 +19,11 @@ iters = 20000
 lr = 1e-3
 device = "cuda" if torch.cuda.is_available() else "cpu"
 save_path = "./vis/test_car_fit_random.png"
+
+# seed initialization
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
 
 # wandb login
 wandb.login(key="c607812d07dd287739ac6ae32c2be43cea6dc664")
