@@ -14,8 +14,8 @@ seed = 42
 root = "../data/3D"
 split = "test"
 synsets = ["02958343"]
-num_points = 40960
-iters = 20000
+num_points = 20480
+iters = 50
 lr = 1e-3
 device = "cuda" if torch.cuda.is_available() else "cpu"
 save_path = "./vis/test_car_fit_random.png"
@@ -82,7 +82,7 @@ obj0_inv = torch.linalg.inv(objs[0].to(device))
 for it in range(iters):
     optimizer.zero_grad()
     loss = 0.0
-    for t in range(min(4, imgs.shape[0])):
+    for t in [0]:  # single-view ground truth supervision
         target = imgs[t].permute(1, 2, 0).to(device)
         viewmat = torch.linalg.inv(cams[t].to(device))
         
@@ -106,16 +106,29 @@ for it in range(iters):
         print(f"Iter {it:04d} | Loss: {loss.item():.6f}")
 
 # visualization
+print(f"\n[INFO] Saving visualization to {save_path}...")
+print(f"  - View 0: Training viewpoint (supervised)")
+print(f"  - Views 1, 2, 3: Future viewpoints (unseen during training)")
 with torch.no_grad():
-    tiles = []
-    for t in range(min(4, imgs.shape[0])):
+    gt_tiles = []
+    pred_tiles = []
+    num_vis = min(4, imgs.shape[0])
+    for t in range(num_vis):
         target = imgs[t].to(device)
         viewmat = torch.linalg.inv(cams[t].to(device))
         delta = objs[t].to(device) @ obj0_inv
+        
         m_t = (delta @ torch.cat([means, torch.ones(num_points, 1, device=device)], dim=-1).t()).t()[:, :3]
         q_t = quat_mul_xyzw(rotmat3_to_quat_xyzw(delta[:3, :3].unsqueeze(0))[0].unsqueeze(0).expand_as(quats), quats)
+        
         pred, _, _ = render_gaussians_single_cam(m_t, q_t, scales, opacities, colors, viewmat, K, H, W)
-        tiles.extend([target.cpu(), pred.permute(2, 0, 1).clamp(0, 1).cpu()])
-    save_image(make_grid(torch.stack(tiles), nrow=2), save_path)
+        
+        gt_tiles.append(target.cpu())
+        pred_tiles.append(pred.permute(2, 0, 1).clamp(0, 1).cpu())
+        
+    # Stack: First row is GT, Second row is Pred
+    grid = torch.stack(gt_tiles + pred_tiles)
+    save_image(make_grid(grid, nrow=num_vis), save_path)
+    print(f"  ✓ Visualization saved successfully.")
 
 wandb.finish()
