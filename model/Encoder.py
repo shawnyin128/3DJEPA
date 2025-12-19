@@ -29,22 +29,15 @@ class ActionEmbedding(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, yaw_ids: torch.Tensor, pitch_ids: torch.Tensor):
-        yaw_tok = self.yaw_embed(yaw_ids)      # [B, D]
-        pitch_tok = self.pitch_embed(pitch_ids)  # [B, D]
+        yaw_tok = self.yaw_embed(yaw_ids) # [B, D]
+        pitch_tok = self.pitch_embed(pitch_ids) # [B, D]
         concat = torch.cat([yaw_tok, pitch_tok], dim=-1)
-        action_vec = self.mlp(concat)          # 融合向量（用于单一动作 token 兼容现有流程）
+        action_vec = self.mlp(concat)
 
-        # 返回分轴向量与融合向量
         return yaw_tok, pitch_tok, action_vec
 
 
 class SplitActionRMSNorm(nn.Module):
-    """
-    分轴动作调制版 RMSNorm (FiLM)：
-    - yaw_vec、pitch_vec 分别产生 (gamma, beta)，再做简单平均聚合；
-    - 可保持与单一动作向量相同的接口效果，但更强调轴向信息。
-    x: [B, L, D]; yaw_vec/pitch_vec: [B, D]
-    """
     def __init__(self, hidden_size: int):
         super().__init__()
         self.norm = nn.RMSNorm(hidden_size, eps=1e-6)
@@ -98,7 +91,7 @@ class EncoderAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(inputs).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(inputs).view(hidden_shape).transpose(1, 2)
 
-        B, H_q, L, D = query_states.shape
+        _, _, L, D = query_states.shape
         L_img = L - 1
         if L_img > 0:
             cos, sin = build_rope_cache(
@@ -126,15 +119,8 @@ class EncoderAttention(nn.Module):
 
 
 class ActionCrossAttention(nn.Module):
-    """
-    轻量动作→图像 Cross-Attention（残差用）：
-    - q: 图像 tokens [B, L_img, D]
-    - k,v: 动作 tokens（建议用 [yaw_vec, pitch_vec] 堆叠成 2 个 token）[B, 2, D]
-    heads=2, dropout=0.1
-    """
     def __init__(self, hidden_size: int, num_heads: int = 2, dropout: float = 0.1):
         super().__init__()
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
@@ -151,18 +137,17 @@ class ActionCrossAttention(nn.Module):
         nn.init.xavier_uniform_(self.o_proj.weight)
 
     def forward(self, img_tokens: torch.Tensor, act_tokens: torch.Tensor) -> torch.Tensor:
-        # img_tokens: [B, L, D], act_tokens: [B, 2, D]
         B, L, D = img_tokens.shape
-        _, A, _ = act_tokens.shape  # A=2
-        q = self.q_proj(img_tokens).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)   # [B, H, L, d]
-        k = self.k_proj(act_tokens).view(B, A, self.num_heads, self.head_dim).transpose(1, 2)   # [B, H, A, d]
-        v = self.v_proj(act_tokens).view(B, A, self.num_heads, self.head_dim).transpose(1, 2)   # [B, H, A, d]
+        _, A, _ = act_tokens.shape
+        q = self.q_proj(img_tokens).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(act_tokens).view(B, A, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(act_tokens).view(B, A, self.num_heads, self.head_dim).transpose(1, 2)
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B, H, L, A]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
-        attn_out = torch.matmul(attn_weights, v)  # [B, H, L, d]
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)  # [B, L, D]
+        attn_out = torch.matmul(attn_weights, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
         return self.o_proj(attn_out)
 
 
@@ -192,10 +177,10 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.attn = EncoderAttention(hidden_size, head_num, kv_head_num, head_dim)
         self.ffn = EncoderFFN(hidden_size)
-        # 分轴动作调制归一化 + 残差门控（由动作控制）
+
         self.pre_norm = SplitActionRMSNorm(hidden_size)
         self.post_norm = SplitActionRMSNorm(hidden_size)
-        # 轻量 Cross-Attention（动作→图像）与其归一化
+
         self.cross_norm = SplitActionRMSNorm(hidden_size)
         self.act_cross_attn = ActionCrossAttention(hidden_size, num_heads=2, dropout=0.1)
         self.gate_attn = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -206,25 +191,22 @@ class EncoderBlock(nn.Module):
         nn.init.zeros_(self.gate_ffn.bias)
 
     def forward(self, inputs, yaw_vec, pitch_vec):
-        # 先做动作→图像的 Cross-Attention（残差）
-        a_tok = torch.stack([yaw_vec, pitch_vec], dim=1)  # [B, 2, D]
-        img = inputs[:, 1:, :]  # [B, L_img, D]
+        a_tok = torch.stack([yaw_vec, pitch_vec], dim=1)
+        img = inputs[:, 1:, :]
         x_img = img
         h_img = self.cross_norm(img, yaw_vec, pitch_vec)
         h_img = self.act_cross_attn(h_img, a_tok)
         img = x_img + h_img
         inputs = torch.cat([inputs[:, :1, :], img], dim=1)
 
-        # 注意力子层
         x = inputs
         h = self.pre_norm(inputs, yaw_vec, pitch_vec)
         h = self.attn(h)
-        # 残差门控：使用分轴向量的平均作为门控输入
+
         a_avg = 0.5 * (yaw_vec + pitch_vec)
-        g = torch.sigmoid(self.gate_attn(a_avg)).unsqueeze(1)  # [B,1,D]
+        g = torch.sigmoid(self.gate_attn(a_avg)).unsqueeze(1)
         inputs = x + g * h
 
-        # FFN 子层
         x = inputs
         h = self.post_norm(inputs, yaw_vec, pitch_vec)
         h = self.ffn(h)
@@ -245,7 +227,7 @@ class Encoder(nn.Module):
     def forward(self, inputs, actions):
         # encode action tokens
         yaw_ids, pitch_ids = actions[:, 0].long(), actions[:, 1].long()
-        yaw_vec, pitch_vec, action_vec = self.action_embed(yaw_ids, pitch_ids)   # [B, D] x3
+        yaw_vec, pitch_vec, action_vec = self.action_embed(yaw_ids, pitch_ids)
         action_tokens = action_vec.unsqueeze(1)
 
         # concat action + image: [B, 2 + H*W, hidden_size]
